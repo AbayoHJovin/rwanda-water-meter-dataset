@@ -96,38 +96,112 @@ def parse_label_file(label_path, img_w, img_h):
 
 
 def draw_boxes_on_image(image, gt_boxes, pred_boxes, matched_gt, matched_pred):
-    """Draw ground truth (green) and predictions (red/yellow) on image."""
-    img = image.copy()
+    """Draw ground truth (green) and predictions (red/yellow) on image with clean labels."""
+    img_h, img_w = image.shape[:2]
     
-    # Draw ground truth boxes in GREEN
+    # Create a taller canvas to add legend at the bottom
+    legend_height = 200
+    canvas = np.ones((img_h + legend_height, img_w, 3), dtype=np.uint8) * 240
+    canvas[:img_h, :] = image.copy()
+    
+    # Number each box with a small circle
+    box_counter = 1
+    gt_labels = []
+    pred_labels = []
+    
+    # Draw ground truth boxes in GREEN with numbered circles
     for i, gt in enumerate(gt_boxes):
         x1, y1, x2, y2 = map(int, gt['box'])
-        color = (0, 255, 0) if matched_gt[i] else (0, 150, 255)  # green if matched, orange if missed
-        thickness = 2 if matched_gt[i] else 3
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        is_matched = matched_gt[i]
         
-        label = f"GT: {CLASS_NAMES[gt['class']]}"
-        cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.5, color, 1)
+        # Box color: green if matched, orange if missed
+        box_color = (0, 200, 0) if is_matched else (0, 140, 255)
+        thickness = 2 if is_matched else 3
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), box_color, thickness)
+        
+        # Draw number circle in top-left corner of box
+        circle_center = (x1 + 15, y1 + 15)
+        cv2.circle(canvas, circle_center, 12, box_color, -1)
+        cv2.putText(canvas, str(box_counter), (x1 + 10, y1 + 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Store label info for legend
+        status = "✓" if is_matched else "MISSED"
+        gt_labels.append(f"#{box_counter} GT: {CLASS_NAMES[gt['class']]:8s} {status}")
+        box_counter += 1
     
-    # Draw predictions in RED (wrong) or YELLOW (correct)
+    # Draw predictions in YELLOW (correct) or RED (wrong) with numbered circles
     for i, pred in enumerate(pred_boxes):
         x1, y1, x2, y2 = map(int, pred['box'])
+        is_matched = matched_pred[i]
+        conf = pred.get('conf', 0)
         
-        if matched_pred[i]:
-            color = (0, 255, 255)  # yellow = correct
-            thickness = 1
-        else:
-            color = (0, 0, 255)    # red = false positive
-            thickness = 2
+        # Box color: yellow if matched, red if false positive
+        box_color = (0, 200, 200) if is_matched else (0, 0, 255)
+        thickness = 1 if is_matched else 2
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), box_color, thickness)
         
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+        # Draw number circle in bottom-right corner of box
+        circle_center = (x2 - 15, y2 - 15)
+        cv2.circle(canvas, circle_center, 12, box_color, -1)
+        cv2.putText(canvas, str(box_counter), (x2 - 20, y2 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
-        label = f"Pred: {CLASS_NAMES[pred['class']]} ({pred.get('conf', 0):.2f})"
-        cv2.putText(img, label, (x1, y2 + 15), cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.5, color, 1)
+        # Store label info for legend
+        status = "✓" if is_matched else "FALSE+"
+        pred_labels.append(f"#{box_counter} Pred: {CLASS_NAMES[pred['class']]:8s} ({conf:.2f}) {status}")
+        box_counter += 1
     
-    return img
+    # Draw legend panel at the bottom
+    legend_y = img_h + 10
+    
+    # Title
+    cv2.putText(canvas, "LEGEND:", (10, legend_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    legend_y += 25
+    
+    # Color key
+    cv2.rectangle(canvas, (10, legend_y), (30, legend_y + 15), (0, 200, 0), -1)
+    cv2.putText(canvas, "= Ground Truth (Matched)", (35, legend_y + 12), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    
+    cv2.rectangle(canvas, (10, legend_y + 20), (30, legend_y + 35), (0, 140, 255), -1)
+    cv2.putText(canvas, "= Ground Truth (MISSED)", (35, legend_y + 32), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    
+    cv2.rectangle(canvas, (10, legend_y + 40), (30, legend_y + 55), (0, 200, 200), -1)
+    cv2.putText(canvas, "= Prediction (Correct)", (35, legend_y + 52), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    
+    cv2.rectangle(canvas, (10, legend_y + 60), (30, legend_y + 75), (0, 0, 255), -1)
+    cv2.putText(canvas, "= Prediction (Wrong)", (35, legend_y + 72), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    
+    # Box details in two columns
+    details_y = legend_y + 95
+    col1_x = 10
+    col2_x = img_w // 2 + 10
+    
+    # Ground truth column
+    cv2.putText(canvas, "GROUND TRUTH:", (col1_x, details_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 0), 2)
+    details_y += 20
+    for label in gt_labels:
+        cv2.putText(canvas, label, (col1_x, details_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        details_y += 18
+    
+    # Predictions column
+    details_y = legend_y + 95
+    cv2.putText(canvas, "PREDICTIONS:", (col2_x, details_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 100), 2)
+    details_y += 20
+    for label in pred_labels:
+        cv2.putText(canvas, label, (col2_x, details_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        details_y += 18
+    
+    return canvas
 
 
 def main():
