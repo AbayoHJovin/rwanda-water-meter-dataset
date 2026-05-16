@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import shutil
 from pathlib import Path
 from typing import List, Tuple
@@ -152,6 +153,22 @@ def collect_files(source_dir: Path):
 
 def choose_file(paths):
     return sorted(paths, key=lambda p: str(p).lower())[0]
+
+
+def make_new_stem(stem: str, fallback_index: int) -> str:
+    """
+    Derive the output stem from the original filename stem.
+
+    Strategy:
+      - Extract the trailing digits from the stem
+        e.g. 'water_meter_000056' -> 'wm_clean_000056'
+      - If no trailing digits exist, fall back to the sequential counter
+        e.g. 'some_unlabeled_image' -> 'wm_clean_000003'
+    """
+    match = re.search(r"(\d+)$", stem)
+    if match:
+        return f"wm_clean_{match.group(1).zfill(6)}"
+    return f"wm_clean_{fallback_index:06d}"
 
 
 def validate_label_line(
@@ -278,7 +295,10 @@ def prepare_pairs(source_dir: Path, reports_dir: Path):
             + "".join(f"  label: {p}\n" for p in labels_by_stem[stem])
         )
 
-    clean_index = 1
+    # Tracks stems already assigned to catch numeric collisions across
+    # student folders (e.g. two folders both containing water_meter_000056).
+    seen_new_stems: dict[str, str] = {}
+    fallback_index = 1
 
     for stem in matched_stems:
         image_path = choose_file(images_by_stem[stem])
@@ -304,7 +324,16 @@ def prepare_pairs(source_dir: Path, reports_dir: Path):
             )
             continue
 
-        new_stem = f"wm_clean_{clean_index:06d}"
+        new_stem = make_new_stem(stem, fallback_index)
+
+        # If this stem was already claimed by a different original stem,
+        # fall back to the sequential counter to avoid overwriting.
+        if new_stem in seen_new_stems and seen_new_stems[new_stem] != stem:
+            new_stem = f"wm_clean_{fallback_index:06d}"
+
+        seen_new_stems[new_stem] = stem
+        fallback_index += 1
+
         valid_pairs.append((image_path, label_path, new_stem))
 
         mapping_lines.append(
@@ -312,8 +341,6 @@ def prepare_pairs(source_dir: Path, reports_dir: Path):
             f"  image_from: {image_path}\n"
             f"  label_from: {label_path}\n"
         )
-
-        clean_index += 1
 
     (reports_dir / "mapping.txt").write_text("\n".join(mapping_lines), encoding="utf-8")
     (reports_dir / "missing_labels.txt").write_text("\n".join(missing_label_lines), encoding="utf-8")
