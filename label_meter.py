@@ -1,1762 +1,809 @@
 #!/usr/bin/env python3
 """
-01_label_images.py
+01_label_meter.py  —  Water Meter Window Labeler with Image Rotation
 
-Water Meter YOLO Labeler
-- Regular YOLO boxes for all classes except window
-- OBB (Oriented Bounding Box) for window class (class_id == 1)
-  Saved as:  1 x1 y1 x2 y2 x3 y3 x4 y4  (normalised image coords, 4 corners)
-  Loaded back and displayed as a rotated rectangle
-- At inference: compute angle from the 4 corners → rotate crop horizontal → read digits
+Draw the digit-window OBB (Oriented Bounding Box):
+  1. Press W, draw a rectangle over the digit window
+  2. Drag any CORNER or EDGE to resize at any angle
+  3. Drag the CENTER to move
+  4. Drag the ◉ handle (or Shift+Scroll) to rotate
+  5. Press S / Ctrl+S to save
+
+Image rotation (same as label_images.py):
+  - Rotate -15° / +15° / 90° / Custom buttons
+  - Rotation slider for live preview → Apply to save destructively
+  - Ctrl+Left / Ctrl+Right / R shortcut
+
+Other classes (meter, digits, unknown) use regular axis-aligned boxes.
+
+Keyboard:
+  M=meter  W=window(OBB)  0-9=digits  U=unknown
+  N=next   P=prev   S/Ctrl+S=save   Delete=delete selected   R=reject image
+  Ctrl+Z=undo   Escape=deselect
+  Scroll=zoom   Middle-drag=pan   Z=reset zoom
+  Ctrl+[ / Ctrl+] = rotate OBB ±1°   Shift+Scroll = fine rotate OBB
+  Ctrl+Left=-15°  Ctrl+Right=+15°  Ctrl+R=custom rotate
 """
 
-import math
-import os
-import sys
-import shutil
-from dataclasses import dataclass, field
+import math, os, sys, shutil
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import (
-    QAction, QColor, QImage, QKeySequence, QPainter, QPen,
-    QPixmap, QBrush, QWheelEvent, QPolygonF, QTransform,
-)
-from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QLabel,
-    QMainWindow,
-    QPushButton,
-    QHBoxLayout,
-    QVBoxLayout,
-    QWidget,
-    QSizePolicy,
-    QInputDialog,
-    QDialog,
-    QSlider,
-    QFrame,
-    QScrollArea,
-)
+from PySide6.QtCore  import QPointF, QRectF, Qt
+from PySide6.QtGui   import (QAction, QColor, QImage, QKeySequence,
+                              QPainter, QPen, QPixmap, QBrush,
+                              QWheelEvent, QPolygonF)
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,
+                                QLabel, QMainWindow, QPushButton,
+                                QHBoxLayout, QVBoxLayout, QWidget,
+                                QSizePolicy, QDialog, QFrame, QSlider)
 
-
-CLASS_NAMES = [
-    "meter", "window",
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "unknown",
-]
-
+# ── Constants ────────────────────────────────────────────────────────────────
+CLASS_NAMES = ["meter","window","0","1","2","3","4","5","6","7","8","9","unknown"]
 CLASS_COLORS = {
-    0: QColor(0, 255, 0),
-    1: QColor(255, 0, 0),       # window → red
-    2: QColor(255, 255, 0),
-    3: QColor(255, 165, 0),
-    4: QColor(0, 255, 255),
-    5: QColor(255, 0, 255),
-    6: QColor(128, 255, 0),
-    7: QColor(0, 128, 255),
-    8: QColor(255, 128, 128),
-    9: QColor(128, 0, 255),
-    10: QColor(200, 200, 255),
-    11: QColor(255, 200, 200),
-    12: QColor(180, 180, 180),
+    0: QColor(0,200,0),    1: QColor(255,60,60),
+    2: QColor(255,220,0),  3: QColor(255,160,0),  4: QColor(0,220,255),
+    5: QColor(200,0,255),  6: QColor(100,255,0),  7: QColor(0,120,255),
+    8: QColor(255,120,120),9: QColor(140,0,255), 10: QColor(200,200,255),
+    11: QColor(255,200,200),12: QColor(160,160,160),
 }
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-HANDLE_SIZE = 10
-MIN_BOX_SIZE = 5
-
-ZOOM_MIN = 0.1
-ZOOM_MAX = 10.0
-ZOOM_STEP = 0.15
-
-WINDOW_CLASS_ID = 1   # the only class that uses OBB
-
-# How many pixels from the box centre the rotation handle sits (in widget pixels)
-ROTATE_HANDLE_DIST = 28
+IMAGE_EXTENSIONS = {".jpg",".jpeg",".png",".bmp",".webp"}
+WINDOW_CLS = 1
+HANDLE_R   = 9
+ROT_DIST   = 32
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.1, 10.0, 0.15
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def rot2d(x, y, a_rad):
+    c, s = math.cos(a_rad), math.sin(a_rad)
+    return x*c - y*s, x*s + y*c
 
-def list_image_files(folder: str) -> List[str]:
-    return sorted([
-        f for f in os.listdir(folder)
-        if os.path.isfile(os.path.join(folder, f))
-        and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
-    ])
-
-
-def unique_destination_path(destination_path: str) -> str:
-    if not os.path.exists(destination_path):
-        return destination_path
-    folder = os.path.dirname(destination_path)
-    filename = os.path.basename(destination_path)
-    stem, ext = os.path.splitext(filename)
-    counter = 1
-    while True:
-        new_path = os.path.join(folder, f"{stem}_removed_{counter}{ext}")
-        if not os.path.exists(new_path):
-            return new_path
-        counter += 1
-
-
-def rotate_image_keep_size_crop_edges(image, angle_degrees: float):
+def rotate_image(image, angle_deg: float):
+    """Rotate image keeping same canvas size (crops edges)."""
     h, w = image.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle_degrees, 1.0)
-    return cv2.warpAffine(
-        image, matrix, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0),
-    )
+    M = cv2.getRotationMatrix2D((w/2, h/2), angle_deg, 1.0)
+    return cv2.warpAffine(image, M, (w, h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=(0,0,0))
+
+def safe_confirm(parent, title, message, yes_text="Yes", no_text="Cancel") -> bool:
+    d = QDialog(parent); d.setWindowTitle(title); d.setModal(True); d.resize(480,180)
+    lbl = QLabel(message); lbl.setWordWrap(True)
+    y = QPushButton(yes_text); n = QPushButton(no_text)
+    y.clicked.connect(d.accept); n.clicked.connect(d.reject)
+    btns = QHBoxLayout(); btns.addStretch(); btns.addWidget(y); btns.addWidget(n)
+    lay = QVBoxLayout(); lay.addWidget(lbl); lay.addStretch(); lay.addLayout(btns)
+    d.setLayout(lay)
+    return d.exec() == QDialog.Accepted
 
 
-def crop_image(image, x1, y1, x2, y2):
-    h, w = image.shape[:2]
-    x_min = int(max(0, min(x1, x2)))
-    y_min = int(max(0, min(y1, y2)))
-    x_max = int(min(w, max(x1, x2)))
-    y_max = int(min(h, max(y1, y2)))
-    if x_max <= x_min or y_max <= y_min:
-        return None
-    return image[y_min:y_max, x_min:x_max]
-
-
-def safe_message(parent, title: str, message: str, button_text: str = "OK") -> None:
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(title)
-    dialog.setModal(True)
-    dialog.resize(520, 170)
-    label = QLabel(message)
-    label.setWordWrap(True)
-    ok_btn = QPushButton(button_text)
-    ok_btn.clicked.connect(dialog.accept)
-    buttons = QHBoxLayout()
-    buttons.addStretch()
-    buttons.addWidget(ok_btn)
-    layout = QVBoxLayout()
-    layout.addWidget(label)
-    layout.addStretch()
-    layout.addLayout(buttons)
-    dialog.setLayout(layout)
-    dialog.exec()
-
-
-def safe_confirm(parent, title: str, message: str,
-                 yes_text: str = "Yes", no_text: str = "Cancel") -> bool:
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(title)
-    dialog.setModal(True)
-    dialog.resize(560, 200)
-    label = QLabel(message)
-    label.setWordWrap(True)
-    yes_btn = QPushButton(yes_text)
-    no_btn = QPushButton(no_text)
-    yes_btn.clicked.connect(dialog.accept)
-    no_btn.clicked.connect(dialog.reject)
-    buttons = QHBoxLayout()
-    buttons.addStretch()
-    buttons.addWidget(yes_btn)
-    buttons.addWidget(no_btn)
-    layout = QVBoxLayout()
-    layout.addWidget(label)
-    layout.addStretch()
-    layout.addLayout(buttons)
-    dialog.setLayout(layout)
-    return dialog.exec() == QDialog.Accepted
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
+# ── Data classes ─────────────────────────────────────────────────────────────
 @dataclass
 class Box:
-    """Regular axis-aligned bounding box (all classes except window)."""
-    class_id: int
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-    def copy(self) -> "Box":
-        return Box(self.class_id, self.x1, self.y1, self.x2, self.y2)
-
-    def normalized(self, img_w, img_h):
-        x_min = min(self.x1, self.x2)
-        y_min = min(self.y1, self.y2)
-        x_max = max(self.x1, self.x2)
-        y_max = max(self.y1, self.y2)
-        x_center = ((x_min + x_max) / 2.0) / img_w
-        y_center = ((y_min + y_max) / 2.0) / img_h
-        width = (x_max - x_min) / img_w
-        height = (y_max - y_min) / img_h
-        return x_center, y_center, width, height
-
-    @staticmethod
-    def from_normalized(class_id, x_center, y_center, width, height,
-                        img_w, img_h) -> "Box":
-        bw = width * img_w
-        bh = height * img_h
-        cx = x_center * img_w
-        cy = y_center * img_h
-        return Box(class_id, cx - bw / 2.0, cy - bh / 2.0,
-                   cx + bw / 2.0, cy + bh / 2.0)
-
-    def rect(self):
-        return (min(self.x1, self.x2), min(self.y1, self.y2),
-                max(self.x1, self.x2), max(self.y1, self.y2))
-
-    def contains(self, x, y) -> bool:
-        x_min, y_min, x_max, y_max = self.rect()
-        return x_min <= x <= x_max and y_min <= y <= y_max
-
-    def width(self):
-        return abs(self.x2 - self.x1)
-
-    def height(self):
-        return abs(self.y2 - self.y1)
-
-    def is_too_small(self, min_size=MIN_BOX_SIZE) -> bool:
-        return self.width() < min_size or self.height() < min_size
-
-    def move(self, dx, dy, img_w, img_h) -> None:
-        x_min, y_min, x_max, y_max = self.rect()
-        box_w = x_max - x_min
-        box_h = y_max - y_min
-        new_x_min = max(0, min(img_w - box_w, x_min + dx))
-        new_y_min = max(0, min(img_h - box_h, y_min + dy))
-        self.x1 = new_x_min
-        self.y1 = new_y_min
-        self.x2 = new_x_min + box_w
-        self.y2 = new_y_min + box_h
-
-    def clamp(self, img_w, img_h) -> None:
-        self.x1 = max(0, min(img_w - 1, self.x1))
-        self.y1 = max(0, min(img_h - 1, self.y1))
-        self.x2 = max(0, min(img_w - 1, self.x2))
-        self.y2 = max(0, min(img_h - 1, self.y2))
+    cls: int; x1: float; y1: float; x2: float; y2: float
+    def copy(self): return Box(self.cls,self.x1,self.y1,self.x2,self.y2)
+    def rect(self): return min(self.x1,self.x2),min(self.y1,self.y2),max(self.x1,self.x2),max(self.y1,self.y2)
+    def contains(self,x,y):
+        a,b,c,d=self.rect(); return a<=x<=c and b<=y<=d
+    def w(self): return abs(self.x2-self.x1)
+    def h(self): return abs(self.y2-self.y1)
+    def too_small(self): return self.w()<4 or self.h()<4
+    def normalized(self,iw,ih):
+        a,b,c,d=self.rect()
+        return (a+c)/2/iw,(b+d)/2/ih,(c-a)/iw,(d-b)/ih
+    def move(self,dx,dy,iw,ih):
+        a,b,c,d=self.rect(); bw,bh=c-a,d-b
+        nx=max(0,min(iw-bw,a+dx)); ny=max(0,min(ih-bh,b+dy))
+        self.x1,self.y1,self.x2,self.y2=nx,ny,nx+bw,ny+bh
+    def clamp(self,iw,ih):
+        self.x1=max(0,min(iw,self.x1)); self.y1=max(0,min(ih,self.y1))
+        self.x2=max(0,min(iw,self.x2)); self.y2=max(0,min(ih,self.y2))
 
 
 @dataclass
-class OBBBox:
-    """
-    Oriented bounding box for the window class.
+class OBB:
+    """Oriented bounding box stored as cx,cy,w,h (pixels) + angle (degrees CCW)."""
+    cx: float; cy: float; w: float; h: float; angle: float = 0.0
+    cls: int = WINDOW_CLS
 
-    Internally stored as:
-        cx, cy   — centre in image pixels
-        w, h     — full width and height in image pixels
-                   (w = long side = along the digit strip)
-        angle    — rotation in degrees, CCW from the positive-x axis
-                   (0° means the long side is horizontal/pointing right)
+    def copy(self): return OBB(self.cx,self.cy,self.w,self.h,self.angle,self.cls)
 
-    On disk (YOLO-OBB format, normalised):
-        1  x1 y1  x2 y2  x3 y3  x4 y4
-    Corner order: top-left → top-right → bottom-right → bottom-left
-    relative to the *unrotated* rectangle, then rotated by `angle`.
-    """
-    class_id: int          # always WINDOW_CLASS_ID
-    cx: float
-    cy: float
-    w: float               # long dimension (along digit row)
-    h: float               # short dimension
-    angle: float = 0.0     # degrees, CCW
+    def corners(self) -> List[Tuple[float,float]]:
+        hw,hh=self.w/2,self.h/2; rad=math.radians(self.angle)
+        return [(rot2d(lx,ly,rad)[0]+self.cx, rot2d(lx,ly,rad)[1]+self.cy)
+                for lx,ly in [(-hw,-hh),(hw,-hh),(hw,hh),(-hw,hh)]]
 
-    def copy(self) -> "OBBBox":
-        return OBBBox(self.class_id, self.cx, self.cy,
-                      self.w, self.h, self.angle)
+    def corners_w(self,sc,ox,oy):
+        return [(x*sc+ox,y*sc+oy) for x,y in self.corners()]
 
-    # ---- geometry --------------------------------------------------------
+    def handle_points(self):
+        c=self.corners()
+        mids=[((c[i][0]+c[(i+1)%4][0])/2,(c[i][1]+c[(i+1)%4][1])/2) for i in range(4)]
+        return c+mids
 
-    def corners_image(self) -> List[Tuple[float, float]]:
-        """Return the 4 corners in image pixel space."""
-        hw = self.w / 2.0
-        hh = self.h / 2.0
-        rad = math.radians(self.angle)
-        cos_a = math.cos(rad)
-        sin_a = math.sin(rad)
+    def rot_handle(self,sc,ox,oy):
+        c=self.corners()
+        tx,ty=(c[0][0]+c[1][0])/2,(c[0][1]+c[1][1])/2
+        rad=math.radians(self.angle); dist=ROT_DIST/sc
+        return (tx-math.sin(rad)*dist)*sc+ox, (ty-math.cos(rad)*dist)*sc+oy
 
-        # local corners (unrotated): TL, TR, BR, BL
-        local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
-        corners = []
-        for lx, ly in local:
-            rx = lx * cos_a - ly * sin_a + self.cx
-            ry = lx * sin_a + ly * cos_a + self.cy
-            corners.append((rx, ry))
-        return corners
+    def contains(self,x,y):
+        rad=math.radians(-self.angle); dx,dy=x-self.cx,y-self.cy
+        lx,ly=rot2d(dx,dy,rad)
+        return abs(lx)<=self.w/2 and abs(ly)<=self.h/2
 
-    def corners_widget(self, scale, offset_x, offset_y):
-        return [
-            (x * scale + offset_x, y * scale + offset_y)
-            for x, y in self.corners_image()
-        ]
+    def too_small(self): return self.w<4 or self.h<4
 
-    def rotate_handle_widget(self, scale, offset_x, offset_y):
-        """Widget coords of the rotation handle (above the top-centre)."""
-        rad = math.radians(self.angle)
-        # The "up" direction perpendicular to the long axis, outward from top edge
-        perp_x = -math.sin(rad)
-        perp_y =  math.cos(rad)
-        # top-centre of the box in image space
-        hw = self.w / 2.0
-        hh = self.h / 2.0
-        tx = self.cx + (-hh) * math.sin(rad)  # top-centre image x
-        ty = self.cy + (-hh) * math.cos(rad)  # top-centre image y  -- wait, let me redo
-
-        # Better: centre of the top edge
-        c = self.corners_image()
-        top_cx = (c[0][0] + c[1][0]) / 2.0
-        top_cy = (c[0][1] + c[1][1]) / 2.0
-
-        # Move outward by ROTATE_HANDLE_DIST / scale (in image pixels)
-        dist_img = ROTATE_HANDLE_DIST / scale
-        hx = top_cx + perp_x * dist_img
-        hy = top_cy + perp_y * dist_img
-
-        return hx * scale + offset_x, hy * scale + offset_y
-
-    def contains_point(self, x, y) -> bool:
-        """Test if image-pixel point (x,y) is inside the rotated rect."""
-        rad = math.radians(-self.angle)
-        cos_a = math.cos(rad)
-        sin_a = math.sin(rad)
-        dx = x - self.cx
-        dy = y - self.cy
-        lx = dx * cos_a - dy * sin_a
-        ly = dx * sin_a + dy * cos_a
-        return abs(lx) <= self.w / 2.0 and abs(ly) <= self.h / 2.0
-
-    def is_too_small(self, min_size=MIN_BOX_SIZE) -> bool:
-        return self.w < min_size or self.h < min_size
-
-    def move(self, dx, dy) -> None:
-        self.cx += dx
-        self.cy += dy
-
-    # ---- serialisation ---------------------------------------------------
-
-    def to_yolo_line(self, img_w, img_h) -> str:
-        corners = self.corners_image()
-        parts = [str(self.class_id)]
-        for cx_pt, cy_pt in corners:
-            parts.append(f"{cx_pt / img_w:.6f}")
-            parts.append(f"{cy_pt / img_h:.6f}")
-        return " ".join(parts)
+    def to_yolo(self,iw,ih):
+        pts=self.corners()
+        vals=[str(self.cls)]
+        for px,py in pts: vals+=[f"{px/iw:.6f}",f"{py/ih:.6f}"]
+        return " ".join(vals)
 
     @staticmethod
-    def from_yolo_line(parts, img_w, img_h) -> "OBBBox":
-        """Parse:  class_id x1 y1 x2 y2 x3 y3 x4 y4  (9 values)."""
-        class_id = int(parts[0])
-        coords = [float(v) for v in parts[1:9]]
-        pts = [(coords[i] * img_w, coords[i + 1] * img_h)
-               for i in range(0, 8, 2)]
-
-        # Recover cx, cy, w, h, angle from the 4 corners
-        cx = sum(p[0] for p in pts) / 4.0
-        cy = sum(p[1] for p in pts) / 4.0
-
-        # Width = distance TL→TR, height = distance TL→BL
-        w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
-        h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
-
-        # Angle from TL→TR edge
-        angle = math.degrees(math.atan2(pts[1][1] - pts[0][1],
-                                         pts[1][0] - pts[0][0]))
-        return OBBBox(class_id, cx, cy, w, h, angle)
+    def from_yolo(parts,iw,ih):
+        cls=int(parts[0])
+        coords=[float(v) for v in parts[1:9]]
+        pts=[(coords[i]*iw,coords[i+1]*ih) for i in range(0,8,2)]
+        cx=sum(p[0] for p in pts)/4; cy=sum(p[1] for p in pts)/4
+        w=math.hypot(pts[1][0]-pts[0][0],pts[1][1]-pts[0][1])
+        h=math.hypot(pts[3][0]-pts[0][0],pts[3][1]-pts[0][1])
+        angle=math.degrees(math.atan2(pts[1][1]-pts[0][1],pts[1][0]-pts[0][0]))
+        return OBB(cx,cy,w,h,angle,cls)
 
 
-# ---------------------------------------------------------------------------
-# Canvas
-# ---------------------------------------------------------------------------
-
-class ImageCanvas(QLabel):
+# ── Rotation Slider (identical logic to label_images.py) ─────────────────────
+class RotationSlider(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFixedHeight(52)
+        self._SCALE = 10
+        self.app = None
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(-1800); self.slider.setMaximum(1800)
+        self.slider.setValue(0)
+        self.slider.setTickInterval(150); self.slider.setTickPosition(QSlider.TicksBelow)
+        self.slider.setSingleStep(1);    self.slider.setPageStep(150)
+
+        self.angle_lbl = QLabel("0.0°")
+        self.angle_lbl.setFixedWidth(52); self.angle_lbl.setAlignment(Qt.AlignCenter)
+        self.angle_lbl.setStyleSheet("font-weight:bold;color:#ddd;")
+
+        reset_btn = QPushButton("↺ Reset"); reset_btn.setFixedWidth(64)
+        reset_btn.clicked.connect(self.reset)
+
+        apply_btn = QPushButton("✔ Apply"); apply_btn.setFixedWidth(70)
+        apply_btn.setToolTip("Write rotation to disk and clear labels")
+        apply_btn.clicked.connect(self._apply)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6,4,6,4); row.setSpacing(6)
+        lbl = QLabel("Rotate:"); lbl.setStyleSheet("color:#aaa;")
+        row.addWidget(lbl); row.addWidget(self.slider, stretch=1)
+        row.addWidget(self.angle_lbl); row.addWidget(reset_btn); row.addWidget(apply_btn)
+
+        self.slider.valueChanged.connect(self._changed)
+
+    def angle(self) -> float: return self.slider.value()/self._SCALE
+    def reset(self): self.slider.setValue(0)
+
+    def _changed(self, v):
+        a = v/self._SCALE
+        self.angle_lbl.setText(f"{a:.1f}°")
+        if self.app: self.app.on_slider_changed(a)
+
+    def _apply(self):
+        a = self.angle()
+        if self.app: self.app.apply_slider_rotation(a)
+        self.slider.setValue(0)
+
+
+# ── Canvas ───────────────────────────────────────────────────────────────────
+class Canvas(QLabel):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.main_window = None
-        self.base_pixmap = None
-        self.display_pixmap = None
-
+        self.base_pix  = None
+        self.scale     = 1.0
         self.fit_scale = 1.0
-        self.zoom_level = 1.0
-        self.scale = 1.0
-        self.pan_offset_x = 0.0
-        self.pan_offset_y = 0.0
-        self.offset_x = 0
-        self.offset_y = 0
+        self.zoom      = 1.0
+        self.ox = self.oy = 0
+        self.pan_x = self.pan_y = 0.0
 
-        self.mode = "idle"
-        self.crop_mode_enabled = False
-        self.resize_handle = None
+        self.mode            = "idle"
+        self.drag_start_w    = None
+        self.drag_last_img   = None
+        self._dlw            = None
+        self.pan_start       = None
+        self.pan_start_off   = None
+        self.obb_rot_start   = 0.0
+        self.obb_rot_mouse   = 0.0
+        self.obb_handle_idx  = None
+        self.box_backup      = None
 
-        self.start_widget_point = None
-        self.current_widget_point = None
-        self.last_img_point = None
-        self.original_box_before_edit = None
+    @property
+    def drag_last_w(self): return self._dlw
+    @drag_last_w.setter
+    def drag_last_w(self, v): self._dlw = v
 
-        # OBB-specific interaction state
-        self._obb_rotating = False          # True while dragging the rotate handle
-        self._obb_rotate_start_angle = 0.0  # box.angle when drag started
-        self._obb_rotate_mouse_angle = 0.0  # mouse angle from centre when drag started
+    # ── coords ────────────────────────────────────────────────────────
+    def w2i(self, qp: QPointF):
+        x=(qp.x()-self.ox)/self.scale; y=(qp.y()-self.oy)/self.scale
+        if x<0 or y<0: return None
+        if self.base_pix and (x>self.base_pix.width() or y>self.base_pix.height()): return None
+        return x, y
 
-        self._pan_start = None
-        self._pan_start_offset = None
+    # ── render ────────────────────────────────────────────────────────
+    def refresh(self):
+        if self.base_pix is None: self.clear(); return
+        lw,lh=max(1,self.width()),max(1,self.height())
+        iw,ih=self.base_pix.width(),self.base_pix.height()
+        self.fit_scale=min(lw/iw,lh/ih); self.scale=self.fit_scale*self.zoom
+        dw,dh=int(iw*self.scale),int(ih*self.scale)
+        self.ox=int(lw/2-dw/2+self.pan_x); self.oy=int(lh/2-dh/2+self.pan_y)
+        canvas=QPixmap(lw,lh); canvas.fill(Qt.black)
+        p=QPainter(canvas)
+        p.drawPixmap(self.ox,self.oy,self.base_pix.scaled(dw,dh,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+        self.app.draw_all(p,self.scale,self.ox,self.oy)
+        if self.mode=="drawing" and self.drag_start_w and self.drag_last_w:
+            color=CLASS_COLORS.get(self.app.cur_cls,QColor(255,255,255))
+            p.setPen(QPen(color,2,Qt.DashLine)); p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(self.drag_start_w,self.drag_last_w).normalized())
+        p.end(); self.setPixmap(canvas)
 
-    def set_main_window(self, window):
-        self.main_window = window
+    def set_image(self, pix: QPixmap):
+        self.base_pix=pix; self.zoom=1.0; self.pan_x=self.pan_y=0.0; self.refresh()
 
-    def set_image(self, qpixmap: QPixmap):
-        self.base_pixmap = qpixmap
-        self.zoom_level = 1.0
-        self.pan_offset_x = 0.0
-        self.pan_offset_y = 0.0
-        self.update_scaled_pixmap()
+    def resizeEvent(self,e): super().resizeEvent(e); self.refresh()
 
-    def clear_image(self):
-        self.base_pixmap = None
-        self.display_pixmap = None
-        self.clear()
+    # ── zoom ──────────────────────────────────────────────────────────
+    def apply_zoom(self, factor, anchor=None):
+        old=self.zoom; self.zoom=max(ZOOM_MIN,min(ZOOM_MAX,self.zoom*factor))
+        if anchor and self.base_pix:
+            ax,ay=anchor.x(),anchor.y()
+            iw,ih=self.base_pix.width(),self.base_pix.height()
+            old_sc=self.fit_scale*old
+            old_ox=(self.width()-iw*old_sc)/2+self.pan_x
+            old_oy=(self.height()-ih*old_sc)/2+self.pan_y
+            imgx=(ax-old_ox)/old_sc; imgy=(ay-old_oy)/old_sc
+            new_sc=self.fit_scale*self.zoom
+            self.pan_x=ax-(self.width()-iw*new_sc)/2-imgx*new_sc
+            self.pan_y=ay-(self.height()-ih*new_sc)/2-imgy*new_sc
+        self.refresh(); self.app.update_zoom_label()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.update_scaled_pixmap()
+    def wheelEvent(self,e: QWheelEvent):
+        if self.base_pix is None: return
+        if e.modifiers() & Qt.ShiftModifier:
+            self.app.rotate_selected_obb(0.5 if e.angleDelta().y()>0 else -0.5)
+            e.accept(); return
+        factor=1.15 if e.angleDelta().y()>0 else 1/1.15
+        self.apply_zoom(factor,QPointF(e.position())); e.accept()
 
-    # ------------------------------------------------------------------
-    def update_scaled_pixmap(self):
-        if self.base_pixmap is None:
-            self.clear()
-            return
+    # ── mouse ─────────────────────────────────────────────────────────
+    def mousePressEvent(self,e):
+        if self.base_pix is None or e.button() not in (Qt.LeftButton,Qt.MiddleButton): return
+        wp=QPointF(e.position())
+        if e.button()==Qt.MiddleButton:
+            self.pan_start=wp; self.pan_start_off=(self.pan_x,self.pan_y); return
+        ip=self.w2i(wp)
 
-        label_w = max(1, self.width())
-        label_h = max(1, self.height())
-        img_w = self.base_pixmap.width()
-        img_h = self.base_pixmap.height()
+        # OBB rotation handle
+        for i,obb in enumerate(self.app.obbs):
+            hx,hy=obb.rot_handle(self.scale,self.ox,self.oy)
+            if math.hypot(wp.x()-hx,wp.y()-hy)<=12:
+                self.app.push_undo()
+                self.app.sel=("obb",i)
+                self.obb_rot_start=obb.angle
+                cx_w=obb.cx*self.scale+self.ox; cy_w=obb.cy*self.scale+self.oy
+                self.obb_rot_mouse=math.degrees(math.atan2(wp.y()-cy_w,wp.x()-cx_w))
+                self.mode="obb_rotating"; return
 
-        scale_x = label_w / img_w
-        scale_y = label_h / img_h
-        self.fit_scale = min(scale_x, scale_y)
-        self.scale = self.fit_scale * self.zoom_level
+        # OBB resize handles
+        for i,obb in enumerate(self.app.obbs):
+            for hi,(hxi,hyi) in enumerate(obb.handle_points()):
+                if math.hypot(wp.x()-hxi*self.scale-self.ox, wp.y()-hyi*self.scale-self.oy)<=HANDLE_R+2:
+                    self.app.push_undo(); self.app.sel=("obb",i)
+                    self.obb_handle_idx=hi; self.box_backup=obb.copy()
+                    self.drag_start_w=wp; self.drag_last_img=ip
+                    self.mode="obb_resizing"; return
 
-        disp_w = int(img_w * self.scale)
-        disp_h = int(img_h * self.scale)
+        # OBB interior (move)
+        if ip:
+            for i,obb in enumerate(reversed(self.app.obbs)):
+                ri=len(self.app.obbs)-1-i
+                if obb.contains(*ip):
+                    self.app.push_undo(); self.app.sel=("obb",ri)
+                    self.box_backup=obb.copy(); self.drag_last_img=ip
+                    self.mode="obb_moving"; return
 
-        center_x = label_w / 2.0
-        center_y = label_h / 2.0
-        self.offset_x = int(center_x - disp_w / 2.0 + self.pan_offset_x)
-        self.offset_y = int(center_y - disp_h / 2.0 + self.pan_offset_y)
+        # Regular box handles
+        if ip:
+            hit=self.app.box_handle_at(*ip)
+            if hit:
+                bi,hname=hit; self.app.push_undo(); self.app.sel=("box",bi)
+                self.box_backup=self.app.boxes[bi].copy()
+                self.drag_last_img=ip; self.obb_handle_idx=hname
+                self.mode="resizing"; return
+            for i in range(len(self.app.boxes)-1,-1,-1):
+                if self.app.boxes[i].contains(*ip):
+                    self.app.push_undo(); self.app.sel=("box",i)
+                    self.box_backup=self.app.boxes[i].copy()
+                    self.drag_last_img=ip; self.mode="moving"; return
 
-        self.display_pixmap = self.base_pixmap.scaled(
-            disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.app.sel=None; self.drag_start_w=wp; self.drag_last_w=wp
+        self.drag_last_img=ip; self.mode="drawing"; self.refresh()
 
-        canvas = QPixmap(label_w, label_h)
-        canvas.fill(Qt.black)
+    def mouseMoveEvent(self,e):
+        if self.base_pix is None: return
+        wp=QPointF(e.position()); ip=self.w2i(wp)
+        if self.pan_start and (e.buttons()&Qt.MiddleButton):
+            self.pan_x=self.pan_start_off[0]+(wp.x()-self.pan_start.x())
+            self.pan_y=self.pan_start_off[1]+(wp.y()-self.pan_start.y())
+            self.refresh(); return
+        if self.mode=="drawing":
+            self.drag_last_w=wp; self.refresh(); return
+        if self.mode=="obb_rotating":
+            sel=self.app.sel
+            if sel and sel[0]=="obb":
+                obb=self.app.obbs[sel[1]]
+                cx_w=obb.cx*self.scale+self.ox; cy_w=obb.cy*self.scale+self.oy
+                cur=math.degrees(math.atan2(wp.y()-cy_w,wp.x()-cx_w))
+                obb.angle=self.obb_rot_start+(cur-self.obb_rot_mouse)
+                self.refresh(); self.app.set_status(f"Window angle {obb.angle:.1f}°"); return
+        if self.mode=="obb_resizing" and ip and self.drag_last_img:
+            sel=self.app.sel
+            if sel and sel[0]=="obb":
+                self._obb_resize(self.app.obbs[sel[1]],ip); self.refresh(); return
+        if self.mode=="obb_moving" and ip and self.drag_last_img:
+            sel=self.app.sel
+            if sel and sel[0]=="obb":
+                obb=self.app.obbs[sel[1]]
+                obb.cx+=ip[0]-self.drag_last_img[0]; obb.cy+=ip[1]-self.drag_last_img[1]
+                self.drag_last_img=ip; self.refresh(); return
+        if self.mode=="moving" and ip and self.drag_last_img:
+            sel=self.app.sel
+            if sel and sel[0]=="box":
+                b=self.app.boxes[sel[1]]
+                b.move(ip[0]-self.drag_last_img[0],ip[1]-self.drag_last_img[1],self.app.iw,self.app.ih)
+                self.drag_last_img=ip; self.refresh(); return
+        if self.mode=="resizing" and ip:
+            sel=self.app.sel
+            if sel and sel[0]=="box":
+                b=self.app.boxes[sel[1]]; h=self.obb_handle_idx
+                if h=="tl": b.x1,b.y1=ip
+                elif h=="tr": b.x2,b.y1=ip
+                elif h=="bl": b.x1,b.y2=ip
+                elif h=="br": b.x2,b.y2=ip
+                b.clamp(self.app.iw,self.app.ih); self.refresh(); return
 
-        painter = QPainter(canvas)
-        painter.drawPixmap(self.offset_x, self.offset_y, self.display_pixmap)
+    def _obb_resize(self,obb,ip):
+        hi=self.obb_handle_idx
+        if hi is None or self.box_backup is None: return
+        bk=self.box_backup; rad=math.radians(bk.angle)
+        dx_w=ip[0]-bk.cx; dy_w=ip[1]-bk.cy
+        lx,ly=rot2d(dx_w,dy_w,-rad)
+        if   hi==0: obb.w,obb.h=max(4,2*(-lx)),max(4,2*(-ly))
+        elif hi==1: obb.w,obb.h=max(4,2*lx),   max(4,2*(-ly))
+        elif hi==2: obb.w,obb.h=max(4,2*lx),   max(4,2*ly)
+        elif hi==3: obb.w,obb.h=max(4,2*(-lx)),max(4,2*ly)
+        elif hi==4: obb.h=max(4,2*(-ly))
+        elif hi==5: obb.w=max(4,2*lx)
+        elif hi==6: obb.h=max(4,2*ly)
+        elif hi==7: obb.w=max(4,2*(-lx))
+        self.drag_last_img=ip
 
-        if self.main_window is not None:
-            self.main_window.draw_boxes(painter, self.scale,
-                                        self.offset_x, self.offset_y)
-
-        # Draft rectangle while drawing
-        if self.mode in ("drawing", "crop") and \
-                self.start_widget_point and self.current_widget_point:
-            if self.mode == "crop":
-                draft_color = QColor(0, 255, 255)
-            else:
-                draft_color = CLASS_COLORS.get(
-                    self.main_window.current_class_id, QColor(255, 255, 255))
-            painter.setPen(QPen(draft_color, 2, Qt.DashLine))
-            painter.setBrush(Qt.NoBrush)
-            rect = QRectF(self.start_widget_point,
-                          self.current_widget_point).normalized()
-            painter.drawRect(rect)
-
-        painter.end()
-        self.setPixmap(canvas)
-
-    # ------------------------------------------------------------------
-    def widget_to_image(self, point: QPointF):
-        if self.base_pixmap is None or self.display_pixmap is None:
-            return None
-        x = point.x() - self.offset_x
-        y = point.y() - self.offset_y
-        if x < 0 or y < 0 or \
-                x > self.display_pixmap.width() or \
-                y > self.display_pixmap.height():
-            return None
-        return x / self.scale, y / self.scale
-
-    # ------------------------------------------------------------------
-    # Zoom
-    # ------------------------------------------------------------------
-    def apply_zoom(self, factor: float, anchor_widget_pos: QPointF = None):
-        old_zoom = self.zoom_level
-        new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom_level * factor))
-        if abs(new_zoom - old_zoom) < 1e-9:
-            return
-
-        if anchor_widget_pos is not None:
-            ax = anchor_widget_pos.x()
-            ay = anchor_widget_pos.y()
-            label_w = self.width()
-            label_h = self.height()
-            img_w = self.base_pixmap.width()
-            img_h = self.base_pixmap.height()
-            old_scale = self.fit_scale * old_zoom
-            old_disp_w = img_w * old_scale
-            old_disp_h = img_h * old_scale
-            old_ox = (label_w - old_disp_w) / 2.0 + self.pan_offset_x
-            old_oy = (label_h - old_disp_h) / 2.0 + self.pan_offset_y
-            img_x = (ax - old_ox) / old_scale
-            img_y = (ay - old_oy) / old_scale
-            new_scale = self.fit_scale * new_zoom
-            new_disp_w = img_w * new_scale
-            new_disp_h = img_h * new_scale
-            self.pan_offset_x = ax - (label_w - new_disp_w) / 2.0 - img_x * new_scale
-            self.pan_offset_y = ay - (label_h - new_disp_h) / 2.0 - img_y * new_scale
-
-        self.zoom_level = new_zoom
-        self.update_scaled_pixmap()
-        if self.main_window:
-            self.main_window.update_zoom_indicator()
-
-    def reset_zoom(self):
-        self.zoom_level = 1.0
-        self.pan_offset_x = 0.0
-        self.pan_offset_y = 0.0
-        self.update_scaled_pixmap()
-        if self.main_window:
-            self.main_window.update_zoom_indicator()
-
-    # ------------------------------------------------------------------
-    # Mouse events
-    # ------------------------------------------------------------------
-    def wheelEvent(self, event: QWheelEvent):
-        if self.base_pixmap is None:
-            return
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-
-        mods = event.modifiers()
-        # Shift+Scroll → rotate selected OBB box
-        if mods & Qt.ShiftModifier:
-            if self.main_window:
-                step = 0.5 if delta > 0 else -0.5
-                self.main_window.rotate_selected_obb(step)
-            event.accept()
-            return
-
-        factor = (1.0 + ZOOM_STEP) if delta > 0 else (1.0 / (1.0 + ZOOM_STEP))
-        self.apply_zoom(factor, QPointF(event.position()))
-        event.accept()
-
-    def mousePressEvent(self, event):
-        if self.base_pixmap is None or self.main_window is None:
-            return
-
-        if event.button() == Qt.MiddleButton:
-            self._pan_start = QPointF(event.position())
-            self._pan_start_offset = (self.pan_offset_x, self.pan_offset_y)
-            return
-
-        if event.button() != Qt.LeftButton:
-            return
-
-        widget_pos = QPointF(event.position())
-        img_pos = self.widget_to_image(widget_pos)
-
-        # --- check OBB rotate handle first ---
-        rot_idx = self.main_window.get_obb_rotate_handle_at(widget_pos)
-        if rot_idx is not None:
-            self.main_window.push_undo_state()
-            self.main_window.selected_box_index = rot_idx
-            self._obb_rotating = True
-            box = self.main_window.obb_boxes[rot_idx]
-            self._obb_rotate_start_angle = box.angle
-            cx_w = box.cx * self.scale + self.offset_x
-            cy_w = box.cy * self.scale + self.offset_y
-            self._obb_rotate_mouse_angle = math.degrees(
-                math.atan2(widget_pos.y() - cy_w, widget_pos.x() - cx_w))
-            self.mode = "obb_rotating"
-            return
-
-        if img_pos is None:
-            return
-
-        self.start_widget_point = widget_pos
-        self.current_widget_point = widget_pos
-        self.last_img_point = img_pos
-
-        if self.crop_mode_enabled:
-            self.mode = "crop"
-            self.update_scaled_pixmap()
-            return
-
-        # --- check regular box handles ---
-        handle = self.main_window.get_handle_at(*img_pos)
-        if handle is not None:
-            self.main_window.push_undo_state()
-            self.mode = "resizing"
-            self.resize_handle = handle[1]
-            self.main_window.selected_box_index = handle[0]
-            self.original_box_before_edit = \
-                self.main_window.boxes[handle[0]].copy()
-            self.update_scaled_pixmap()
-            return
-
-        border_box_index = self.main_window.get_border_at(*img_pos)
-        if border_box_index is not None:
-            self.main_window.push_undo_state()
-            self.mode = "moving"
-            self.main_window.selected_box_index = border_box_index
-            self.original_box_before_edit = \
-                self.main_window.boxes[border_box_index].copy()
-            self.update_scaled_pixmap()
-            return
-
-        # --- check OBB box interior for move ---
-        obb_idx = self.main_window.get_obb_at(*img_pos)
-        if obb_idx is not None:
-            self.main_window.push_undo_state()
-            self.mode = "obb_moving"
-            self.main_window.selected_box_index = obb_idx
-            self.original_box_before_edit = \
-                self.main_window.obb_boxes[obb_idx].copy()
-            self.update_scaled_pixmap()
-            return
-
-        # --- click in empty space: deselect or start drawing ---
-        clicked_box_index = self.main_window.find_box_at(*img_pos)
-        self.main_window.selected_box_index = clicked_box_index
-
-        self.mode = "drawing"
-        self.resize_handle = None
-        self.original_box_before_edit = None
-        self.update_scaled_pixmap()
-
-    def mouseMoveEvent(self, event):
-        if self.main_window is None or self.base_pixmap is None:
-            return
-
-        widget_pos = QPointF(event.position())
-
-        if self._pan_start is not None and (event.buttons() & Qt.MiddleButton):
-            dx = widget_pos.x() - self._pan_start.x()
-            dy = widget_pos.y() - self._pan_start.y()
-            self.pan_offset_x = self._pan_start_offset[0] + dx
-            self.pan_offset_y = self._pan_start_offset[1] + dy
-            self.update_scaled_pixmap()
-            return
-
-        # OBB rotate drag
-        if self.mode == "obb_rotating" and self._obb_rotating:
-            idx = self.main_window.selected_box_index
-            if idx is not None and idx < len(self.main_window.obb_boxes):
-                box = self.main_window.obb_boxes[idx]
-                cx_w = box.cx * self.scale + self.offset_x
-                cy_w = box.cy * self.scale + self.offset_y
-                current_mouse_angle = math.degrees(
-                    math.atan2(widget_pos.y() - cy_w, widget_pos.x() - cx_w))
-                delta_angle = current_mouse_angle - self._obb_rotate_mouse_angle
-                box.angle = self._obb_rotate_start_angle + delta_angle
-                self.update_scaled_pixmap()
-                self.main_window.update_status(
-                    extra=f"Rotating window: {box.angle:.1f}°")
-            return
-
-        img_pos = self.widget_to_image(widget_pos)
-
-        if self.mode in ("drawing", "crop"):
-            self.current_widget_point = widget_pos
-            self.update_scaled_pixmap()
-            return
-
-        if img_pos is None:
-            return
-
-        if self.mode == "moving":
-            if self.main_window.selected_box_index is None or \
-                    self.last_img_point is None:
-                return
-            dx = img_pos[0] - self.last_img_point[0]
-            dy = img_pos[1] - self.last_img_point[1]
-            box = self.main_window.boxes[self.main_window.selected_box_index]
-            box.move(dx, dy, self.main_window.current_image_w,
-                     self.main_window.current_image_h)
-            self.last_img_point = img_pos
-            self.update_scaled_pixmap()
-            self.main_window.update_status(extra="Moving box...")
-            return
-
-        if self.mode == "obb_moving":
-            if self.main_window.selected_box_index is None or \
-                    self.last_img_point is None:
-                return
-            dx = img_pos[0] - self.last_img_point[0]
-            dy = img_pos[1] - self.last_img_point[1]
-            box = self.main_window.obb_boxes[self.main_window.selected_box_index]
-            box.move(dx, dy)
-            self.last_img_point = img_pos
-            self.update_scaled_pixmap()
-            self.main_window.update_status(extra="Moving OBB window box...")
-            return
-
-        if self.mode == "resizing":
-            if self.main_window.selected_box_index is None:
-                return
-            box = self.main_window.boxes[self.main_window.selected_box_index]
-            x, y = img_pos
-            if self.resize_handle == "tl":
-                box.x1, box.y1 = x, y
-            elif self.resize_handle == "tr":
-                box.x2, box.y1 = x, y
-            elif self.resize_handle == "bl":
-                box.x1, box.y2 = x, y
-            elif self.resize_handle == "br":
-                box.x2, box.y2 = x, y
-            box.clamp(self.main_window.current_image_w,
-                      self.main_window.current_image_h)
-            self.update_scaled_pixmap()
-            self.main_window.update_status(extra="Resizing box...")
-            return
-
-    def mouseReleaseEvent(self, event):
-        if self.base_pixmap is None or self.main_window is None:
-            return
-
-        if event.button() == Qt.MiddleButton:
-            self._pan_start = None
-            self._pan_start_offset = None
-            return
-
-        if event.button() != Qt.LeftButton:
-            return
-
-        if self.mode == "obb_rotating":
-            self._obb_rotating = False
-            self.mode = "idle"
-            self.update_scaled_pixmap()
-            idx = self.main_window.selected_box_index
-            if idx is not None and idx < len(self.main_window.obb_boxes):
-                a = self.main_window.obb_boxes[idx].angle
-                self.main_window.update_status(
-                    extra=f"Window angle set to {a:.1f}°")
-            return
-
-        if self.mode == "crop":
-            end_point = QPointF(event.position())
-            start_img = self.widget_to_image(self.start_widget_point) \
-                if self.start_widget_point else None
-            end_img = self.widget_to_image(end_point)
-            self.mode = "idle"
-            self.crop_mode_enabled = False
-            if start_img is not None and end_img is not None:
-                self.main_window.crop_current_image(start_img, end_img)
-            else:
-                self.main_window.update_status(extra="Crop cancelled.")
-            self.start_widget_point = None
-            self.current_widget_point = None
-            self.last_img_point = None
-            self.update_scaled_pixmap()
-            return
-
-        if self.mode == "drawing":
-            end_point = QPointF(event.position())
-            start_img = self.widget_to_image(self.start_widget_point) \
-                if self.start_widget_point else None
-            end_img = self.widget_to_image(end_point)
-
-            if start_img is not None and end_img is not None:
-                x1, y1 = start_img
-                x2, y2 = end_img
-
-                if self.main_window.current_class_id == WINDOW_CLASS_ID:
-                    # Create OBB box (initially at 0°)
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
-                    w = abs(x2 - x1)
-                    h = abs(y2 - y1)
-                    new_obb = OBBBox(WINDOW_CLASS_ID, cx, cy, w, h, 0.0)
-                    if not new_obb.is_too_small():
-                        self.main_window.push_undo_state()
-                        self.main_window.obb_boxes.append(new_obb)
-                        self.main_window.selected_box_index = \
-                            len(self.main_window.obb_boxes) - 1
-                        self.main_window.update_status(
-                            extra="Window OBB box added. "
-                                  "Drag the ◉ handle or Shift+Scroll to rotate.")
-                    else:
-                        self.main_window.update_status(extra="Ignored tiny box.")
+    def mouseReleaseEvent(self,e):
+        if e.button()==Qt.MiddleButton: self.pan_start=None; return
+        if e.button()!=Qt.LeftButton: return
+        if self.mode=="drawing":
+            ip_s=self.w2i(self.drag_start_w) if self.drag_start_w else None
+            ip_e=self.w2i(QPointF(e.position()))
+            if ip_s and ip_e:
+                x1,y1=ip_s; x2,y2=ip_e
+                if self.app.cur_cls==WINDOW_CLS:
+                    obb=OBB((x1+x2)/2,(y1+y2)/2,abs(x2-x1),abs(y2-y1),0.0,WINDOW_CLS)
+                    if not obb.too_small():
+                        self.app.push_undo(); self.app.obbs.append(obb)
+                        self.app.sel=("obb",len(self.app.obbs)-1)
+                        self.app.set_status("Window OBB added — drag ◉ or Shift+Scroll to rotate")
                 else:
-                    new_box = Box(self.main_window.current_class_id,
-                                  x1, y1, x2, y2)
-                    if not new_box.is_too_small():
-                        self.main_window.push_undo_state()
-                        self.main_window.boxes.append(new_box)
-                        self.main_window.selected_box_index = \
-                            len(self.main_window.boxes) - 1
-                        self.main_window.update_status(extra="Box added.")
-                    else:
-                        self.main_window.update_status(extra="Ignored tiny box.")
+                    b=Box(self.app.cur_cls,x1,y1,x2,y2)
+                    if not b.too_small():
+                        self.app.push_undo(); self.app.boxes.append(b)
+                        self.app.sel=("box",len(self.app.boxes)-1)
+                        self.app.set_status(f"{CLASS_NAMES[self.app.cur_cls]} box added")
+        self.mode="idle"
+        self.drag_start_w=self.drag_last_w=self.drag_last_img=None
+        self.obb_handle_idx=self.box_backup=None; self.refresh()
 
-        elif self.mode in ("moving", "resizing"):
-            if self.main_window.selected_box_index is not None:
-                box = self.main_window.boxes[self.main_window.selected_box_index]
-                box.clamp(self.main_window.current_image_w,
-                           self.main_window.current_image_h)
-                if box.is_too_small():
-                    if self.original_box_before_edit is not None:
-                        self.main_window.boxes[
-                            self.main_window.selected_box_index] = \
-                            self.original_box_before_edit
-                    self.main_window.update_status(
-                        extra="Edit cancelled: box too small.")
-                else:
-                    self.main_window.update_status(extra="Box updated.")
-
-        elif self.mode == "obb_moving":
-            self.main_window.update_status(extra="Window box moved.")
-
-        self.mode = "idle"
-        self.resize_handle = None
-        self.start_widget_point = None
-        self.current_widget_point = None
-        self.last_img_point = None
-        self.original_box_before_edit = None
-        self.update_scaled_pixmap()
+    def zoom_manual(self, factor):
+        self.zoom=max(ZOOM_MIN,min(ZOOM_MAX,self.zoom*factor)); self.refresh()
+        self.app.update_zoom_label()
 
 
-# ---------------------------------------------------------------------------
-# Rotation slider widget
-# ---------------------------------------------------------------------------
-class RotationSlider(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(56)
-        self._SCALE = 10
-
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setMinimum(-1800)
-        self.slider.setMaximum(1800)
-        self.slider.setValue(0)
-        self.slider.setTickInterval(150)
-        self.slider.setTickPosition(QSlider.TicksBelow)
-        self.slider.setSingleStep(1)
-        self.slider.setPageStep(150)
-
-        self.angle_label = QLabel("0.0°")
-        self.angle_label.setFixedWidth(52)
-        self.angle_label.setAlignment(Qt.AlignCenter)
-        self.angle_label.setStyleSheet("font-weight: bold; color: #ddd;")
-
-        reset_btn = QPushButton("↺ Reset")
-        reset_btn.setFixedWidth(64)
-        reset_btn.setToolTip("Reset rotation to 0°")
-        reset_btn.clicked.connect(self.reset_angle)
-
-        apply_btn = QPushButton("✔ Apply")
-        apply_btn.setFixedWidth(70)
-        apply_btn.setToolTip("Destructively apply rotation and save image")
-        apply_btn.clicked.connect(self._on_apply)
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(6, 4, 6, 4)
-        row.setSpacing(6)
-        rot_label = QLabel("Rotate:")
-        rot_label.setStyleSheet("color: #aaa;")
-        row.addWidget(rot_label)
-        row.addWidget(self.slider, stretch=1)
-        row.addWidget(self.angle_label)
-        row.addWidget(reset_btn)
-        row.addWidget(apply_btn)
-
-        self.slider.valueChanged.connect(self._on_value_changed)
-        self.main_window = None
-
-    def set_main_window(self, window):
-        self.main_window = window
-
-    def current_angle(self) -> float:
-        return self.slider.value() / self._SCALE
-
-    def reset_angle(self):
-        self.slider.setValue(0)
-
-    def _on_value_changed(self, value: int):
-        angle = value / self._SCALE
-        self.angle_label.setText(f"{angle:.1f}°")
-        if self.main_window:
-            self.main_window.on_rotation_slider_changed(angle)
-
-    def _on_apply(self):
-        angle = self.current_angle()
-        if self.main_window:
-            self.main_window.apply_rotation_from_slider(angle)
-        self.slider.setValue(0)
-
-
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
-
-class MainWindow(QMainWindow):
+# ── Main window ───────────────────────────────────────────────────────────────
+class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Water Meter YOLO Labeler")
-        self.resize(1280, 900)
+        self.setWindowTitle("Meter Window Labeler (OBB)")
+        self.resize(1350,920)
 
-        self.image_dir = None
-        self.label_dir = None
-        self.image_files = []
-        self.current_index = 0
+        self.img_dir=self.lbl_dir=None
+        self.img_files: List[str]=[]
+        self.idx=0; self.iw=self.ih=0; self.cur_img=None
+        self.boxes: List[Box]=[]; self.obbs: List[OBB]=[]
+        self.sel=None; self.cur_cls=1; self._undo=[]
+        self._preview_angle=0.0
 
-        self.current_image = None
-        self.current_image_w = 0
-        self.current_image_h = 0
+        # ── Canvas ────────────────────────────────────────────────────
+        self.canvas=Canvas(self)
 
-        self.boxes: List[Box] = []           # regular axis-aligned boxes
-        self.obb_boxes: List[OBBBox] = []    # OBB boxes for window class
-        self.selected_box_index = None       # index into boxes OR obb_boxes
-                                             # (depends on context / mode)
-        self.current_class_id = 0
-        self.undo_stack = []
-        self._preview_angle = 0.0
+        # ── Status ────────────────────────────────────────────────────
+        self.status_lbl=QLabel("Open a folder to start.")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet("color:#ccc;font-size:11px;")
 
-        # --- Canvas ---
-        self.canvas = ImageCanvas()
-        self.canvas.set_main_window(self)
+        # ── Zoom label ────────────────────────────────────────────────
+        self.zoom_lbl=QLabel("100%")
+        self.zoom_lbl.setFixedWidth(55); self.zoom_lbl.setStyleSheet("color:#aaa;")
 
-        # --- Info label ---
-        self.info_label = QLabel("Open an image folder to begin.")
-        self.info_label.setWordWrap(True)
+        # ── Class buttons ─────────────────────────────────────────────
+        cls_row=QHBoxLayout(); cls_row.addWidget(QLabel("Class:"))
+        hex_cols={0:"#00c800",1:"#ff3c3c",2:"#ffdc00",3:"#ffa000",4:"#00dcff",
+                  5:"#c800ff",6:"#64ff00",7:"#0078ff",8:"#ff7878",9:"#8c00ff",
+                  10:"#c8c8ff",11:"#ffc8c8",12:"#a0a0a0"}
+        self._cls_btns=[]
+        for cid,name in enumerate(CLASS_NAMES):
+            b=QPushButton(name); b.setCheckable(True)
+            col=hex_cols.get(cid,"#888")
+            b.setStyleSheet(
+                f"QPushButton{{background:{col};color:#000;font-weight:bold;"
+                f"border:2px solid transparent;border-radius:3px;padding:2px 5px;}}"
+                f"QPushButton:checked{{border:2px solid #fff;}}")
+            b.clicked.connect(lambda _,c=cid: self.set_cls(c))
+            cls_row.addWidget(b); self._cls_btns.append(b)
+        cls_row.addStretch()
 
-        # --- Zoom label ---
-        self.zoom_label = QLabel("Zoom: 100%")
-        self.zoom_label.setFixedWidth(100)
-        self.zoom_label.setAlignment(Qt.AlignCenter)
-        self.zoom_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        # ── Toolbar ───────────────────────────────────────────────────
+        def btn(label,slot,tip=""):
+            b=QPushButton(label); b.setToolTip(tip); b.clicked.connect(slot); return b
 
-        # --- OBB angle indicator ---
-        self.obb_angle_label = QLabel("")
-        self.obb_angle_label.setFixedWidth(160)
-        self.obb_angle_label.setAlignment(Qt.AlignCenter)
-        self.obb_angle_label.setStyleSheet(
-            "color: #ff6666; font-size: 12px; font-weight: bold;")
+        tb=QHBoxLayout()
+        tb.addWidget(btn("📂 Open",       self.open_folder))
+        tb.addWidget(btn("◀ Prev",        self.prev_img,   "P"))
+        tb.addWidget(btn("▶ Next",        self.next_img,   "N"))
+        tb.addWidget(btn("💾 Save",       self.save,       "Ctrl+S"))
+        tb.addWidget(btn("⛔ Reject",     self.reject_img, "R"))
+        sep1=QFrame(); sep1.setFrameShape(QFrame.VLine); tb.addWidget(sep1)
+        tb.addWidget(btn("↶ -15°",        lambda: self.rotate_image(-15)))
+        tb.addWidget(btn("↷ +15°",        lambda: self.rotate_image(15)))
+        tb.addWidget(btn("↻ 90°",         lambda: self.rotate_image(90)))
+        tb.addWidget(btn("✎ Custom°",     self.rotate_custom))
+        sep2=QFrame(); sep2.setFrameShape(QFrame.VLine); tb.addWidget(sep2)
+        tb.addWidget(btn("🔍+", lambda: self.canvas.zoom_manual(1.15)))
+        tb.addWidget(self.zoom_lbl)
+        tb.addWidget(btn("🔍−", lambda: self.canvas.zoom_manual(1/1.15)))
+        tb.addWidget(btn("⊡",  self.zoom_reset, "Z"))
+        tb.addStretch()
 
-        # --- Buttons ---
-        open_btn = QPushButton("Open Folder")
-        open_btn.clicked.connect(self.open_folder)
-        prev_btn = QPushButton("Previous (P)")
-        prev_btn.clicked.connect(self.prev_image)
-        next_btn = QPushButton("Next (N)")
-        next_btn.clicked.connect(self.next_image)
-        save_btn = QPushButton("Save")
-        save_btn.clicked.connect(self.save_labels)
-        remove_btn = QPushButton("Remove Image")
-        remove_btn.clicked.connect(self.remove_current_image)
-        undo_btn = QPushButton("Undo")
-        undo_btn.clicked.connect(self.undo)
-        crop_btn = QPushButton("Crop Image")
-        crop_btn.clicked.connect(self.enable_crop_mode)
-        rot_left_btn = QPushButton("Rotate -15°")
-        rot_left_btn.clicked.connect(lambda: self.rotate_current_image(-15))
-        rot_right_btn = QPushButton("Rotate +15°")
-        rot_right_btn.clicked.connect(lambda: self.rotate_current_image(15))
-        rot_90_btn = QPushButton("Rotate 90°")
-        rot_90_btn.clicked.connect(lambda: self.rotate_current_image(90))
-        rot_custom_btn = QPushButton("Rotate Custom")
-        rot_custom_btn.clicked.connect(self.rotate_custom_angle)
+        hint=QLabel(
+            "W=window(OBB) | M=meter | 0-9=digit | U=unknown | "
+            "Drag corner/edge=resize | Drag ◉=rotate | Shift+Scroll=fine rotate | "
+            "Ctrl+[/]=±1° | R=reject | ↶↷ or slider=rotate image")
+        hint.setStyleSheet("background:#1a0000;color:#ff9999;padding:3px 8px;font-size:11px;")
 
-        zoom_in_btn = QPushButton("Zoom In (+)")
-        zoom_in_btn.clicked.connect(self.zoom_in)
-        zoom_out_btn = QPushButton("Zoom Out (–)")
-        zoom_out_btn.clicked.connect(self.zoom_out)
-        zoom_reset_btn = QPushButton("Zoom Reset")
-        zoom_reset_btn.clicked.connect(self.zoom_reset)
+        # ── Rotation slider ───────────────────────────────────────────
+        self.rot_slider=RotationSlider(); self.rot_slider.app=self
 
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(open_btn)
-        top_bar.addWidget(prev_btn)
-        top_bar.addWidget(next_btn)
-        top_bar.addWidget(save_btn)
-        top_bar.addWidget(remove_btn)
-        top_bar.addWidget(undo_btn)
-        top_bar.addWidget(crop_btn)
-        top_bar.addWidget(rot_left_btn)
-        top_bar.addWidget(rot_right_btn)
-        top_bar.addWidget(rot_90_btn)
-        top_bar.addWidget(rot_custom_btn)
+        # ── Layout ────────────────────────────────────────────────────
+        lay=QVBoxLayout()
+        lay.addLayout(tb); lay.addLayout(cls_row); lay.addWidget(hint)
+        lay.addWidget(self.canvas,stretch=1)
+        lay.addWidget(self.rot_slider)
+        lay.addWidget(self.status_lbl)
+        w=QWidget(); w.setLayout(lay); self.setCentralWidget(w)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        top_bar.addWidget(sep)
+        self._setup_shortcuts(); self.set_cls(1)
 
-        top_bar.addWidget(zoom_out_btn)
-        top_bar.addWidget(self.zoom_label)
-        top_bar.addWidget(zoom_in_btn)
-        top_bar.addWidget(zoom_reset_btn)
-        top_bar.addWidget(self.obb_angle_label)
-        top_bar.addStretch()
-
-        # OBB hint bar
-        obb_hint = QLabel(
-            "  🔴 Window class (W): draw box → drag ◉ handle or Shift+Scroll to rotate  |  "
-            "Ctrl+[ / Ctrl+] = rotate selected window box ±1°"
-        )
-        obb_hint.setStyleSheet(
-            "color: #ff8888; background: #1a0000; "
-            "padding: 3px 8px; font-size: 11px;")
-
-        # Rotation slider
-        self.rotation_slider = RotationSlider()
-        self.rotation_slider.set_main_window(self)
-
-        # Main layout
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(top_bar)
-        main_layout.addWidget(obb_hint)
-        main_layout.addWidget(self.canvas, stretch=1)
-        main_layout.addWidget(self.rotation_slider)
-        main_layout.addWidget(self.info_label)
-
-        central = QWidget()
-        central.setLayout(main_layout)
-        self.setCentralWidget(central)
-
-        self.create_shortcuts()
-        self.create_menu()
-        self.update_status()
-        self.update_zoom_indicator()
-
-    # ------------------------------------------------------------------
-    # OBB helpers
-    # ------------------------------------------------------------------
-    def get_obb_at(self, x, y) -> Optional[int]:
-        """Return index of OBBBox containing image point (x, y), or None."""
-        for i in range(len(self.obb_boxes) - 1, -1, -1):
-            if self.obb_boxes[i].contains_point(x, y):
-                return i
-        return None
-
-    def get_obb_rotate_handle_at(self, widget_pos: QPointF) -> Optional[int]:
-        """Return index of OBBBox whose rotate handle is near widget_pos."""
-        for i in range(len(self.obb_boxes) - 1, -1, -1):
-            hx, hy = self.obb_boxes[i].rotate_handle_widget(
-                self.canvas.scale, self.canvas.offset_x, self.canvas.offset_y)
-            dist = math.hypot(widget_pos.x() - hx, widget_pos.y() - hy)
-            if dist <= 12:
-                return i
-        return None
-
-    def rotate_selected_obb(self, delta_degrees: float):
-        """Rotate currently-selected OBB box by delta_degrees."""
-        if self.selected_box_index is None:
-            return
-        # Determine if selection refers to an OBB box
-        # (selected_box_index is used for both lists; we check obb list first
-        #  when current class is window)
-        if self.current_class_id == WINDOW_CLASS_ID and \
-                0 <= self.selected_box_index < len(self.obb_boxes):
-            self.obb_boxes[self.selected_box_index].angle += delta_degrees
-            self.canvas.update_scaled_pixmap()
-            a = self.obb_boxes[self.selected_box_index].angle
-            self.obb_angle_label.setText(f"Window: {a:.1f}°")
-            self.update_status(extra=f"Window angle: {a:.1f}°")
-        elif 0 <= self.selected_box_index < len(self.obb_boxes):
-            # fallback: if there are obb boxes selected
-            self.obb_boxes[self.selected_box_index].angle += delta_degrees
-            self.canvas.update_scaled_pixmap()
-
-    # ------------------------------------------------------------------
-    # Zoom
-    # ------------------------------------------------------------------
-    def zoom_in(self):
-        if self.canvas.base_pixmap is None:
-            return
-        self.canvas.apply_zoom(1.0 + ZOOM_STEP)
-
-    def zoom_out(self):
-        if self.canvas.base_pixmap is None:
-            return
-        self.canvas.apply_zoom(1.0 / (1.0 + ZOOM_STEP))
-
-    def zoom_reset(self):
-        self.canvas.reset_zoom()
-
-    def update_zoom_indicator(self):
-        pct = int(self.canvas.zoom_level * 100)
-        self.zoom_label.setText(f"Zoom: {pct}%")
-
-    # ------------------------------------------------------------------
-    # Rotation slider callbacks
-    # ------------------------------------------------------------------
-    def on_rotation_slider_changed(self, angle: float):
-        self._preview_angle = angle
-        self._refresh_canvas_with_preview()
-
-    def _refresh_canvas_with_preview(self):
-        if self.current_image is None:
-            return
-        if abs(self._preview_angle) < 0.05:
-            rotated = self.current_image
-        else:
-            rotated = rotate_image_keep_size_crop_edges(
-                self.current_image, self._preview_angle)
-        rgb = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
-        h, w = rotated.shape[:2]
-        qimage = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimage.copy())
-        self.canvas.base_pixmap = pixmap
-        self.canvas.update_scaled_pixmap()
-
-    def apply_rotation_from_slider(self, angle: float):
-        if abs(angle) < 0.05:
-            self.update_status(extra="No rotation to apply.")
-            return
-        self._preview_angle = 0.0
-        self._restore_original_canvas()
-        self.rotate_current_image(angle)
-
-    def _restore_original_canvas(self):
-        if self.current_image is None:
-            return
-        rgb = cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB)
-        h, w = self.current_image.shape[:2]
-        qimage = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888)
-        self.canvas.base_pixmap = QPixmap.fromImage(qimage.copy())
-        self.canvas.update_scaled_pixmap()
-
-    # ------------------------------------------------------------------
-    # Menu + shortcuts
-    # ------------------------------------------------------------------
-    def create_menu(self):
-        open_action = QAction("Open Folder", self)
-        open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self.open_folder)
-
-        save_action = QAction("Save", self)
-        save_action.setShortcut(QKeySequence.Save)
-        save_action.triggered.connect(self.save_labels)
-
-        remove_action = QAction("Remove Image", self)
-        remove_action.setShortcut(QKeySequence("Ctrl+D"))
-        remove_action.triggered.connect(self.remove_current_image)
-
-        undo_action = QAction("Undo", self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.triggered.connect(self.undo)
-
-        crop_action = QAction("Crop Image", self)
-        crop_action.setShortcut(QKeySequence("C"))
-        crop_action.triggered.connect(self.enable_crop_mode)
-
-        zoom_in_action = QAction("Zoom In", self)
-        zoom_in_action.setShortcut(QKeySequence("="))
-        zoom_in_action.triggered.connect(self.zoom_in)
-
-        zoom_out_action = QAction("Zoom Out", self)
-        zoom_out_action.setShortcut(QKeySequence("-"))
-        zoom_out_action.triggered.connect(self.zoom_out)
-
-        zoom_reset_action = QAction("Zoom Reset", self)
-        zoom_reset_action.setShortcut(QKeySequence("Z"))
-        zoom_reset_action.triggered.connect(self.zoom_reset)
-
-        file_menu = self.menuBar().addMenu("File")
-        file_menu.addAction(open_action)
-        file_menu.addAction(save_action)
-        file_menu.addAction(remove_action)
-
-        edit_menu = self.menuBar().addMenu("Edit")
-        edit_menu.addAction(undo_action)
-        edit_menu.addAction(crop_action)
-
-        view_menu = self.menuBar().addMenu("View")
-        view_menu.addAction(zoom_in_action)
-        view_menu.addAction(zoom_out_action)
-        view_menu.addAction(zoom_reset_action)
-
-    def create_shortcuts(self):
-        shortcuts = [
-            ("OpenFolder",    "Ctrl+O",     self.open_folder),
-            ("Save",          "Ctrl+S",     self.save_labels),
-            ("Undo",          "Ctrl+Z",     self.undo),
-            ("Next",          "N",          self.next_image),
-            ("Prev",          "P",          self.prev_image),
-            ("RemoveImage",   "Ctrl+D",     self.remove_current_image),
-            ("CropImage",     "C",          self.enable_crop_mode),
-            ("RotMinus15",    "Ctrl+Left",  lambda: self.rotate_current_image(-15)),
-            ("RotPlus15",     "Ctrl+Right", lambda: self.rotate_current_image(15)),
-            ("Rotate90",      "R",          lambda: self.rotate_current_image(90)),
-            ("RotateCustom",  "Ctrl+R",     self.rotate_custom_angle),
-            ("Meter",         "M",          lambda: self.set_class(0)),
-            ("Window",        "W",          lambda: self.set_class(1)),
-            ("ZeroDigit",     "0",          lambda: self.set_class(2)),
-            ("OneDigit",      "1",          lambda: self.set_class(3)),
-            ("TwoDigit",      "2",          lambda: self.set_class(4)),
-            ("ThreeDigit",    "3",          lambda: self.set_class(5)),
-            ("FourDigit",     "4",          lambda: self.set_class(6)),
-            ("FiveDigit",     "5",          lambda: self.set_class(7)),
-            ("SixDigit",      "6",          lambda: self.set_class(8)),
-            ("SevenDigit",    "7",          lambda: self.set_class(9)),
-            ("EightDigit",    "8",          lambda: self.set_class(10)),
-            ("NineDigit",     "9",          lambda: self.set_class(11)),
-            ("UnknownDigit",  "U",          lambda: self.set_class(12)),
-            ("Delete",        "Delete",     self.delete_selected_box),
-            ("DeleteBksp",    "Backspace",  self.delete_selected_box),
-            ("ClearSel",      "Escape",     self.clear_selection),
-            ("ZoomIn",        "=",          self.zoom_in),
-            ("ZoomOut",       "-",          self.zoom_out),
-            ("ZoomReset",     "Z",          self.zoom_reset),
-            # Fine OBB rotation
-            ("OBBRotCCW",     "Ctrl+[",     lambda: self.rotate_selected_obb(-1.0)),
-            ("OBBRotCW",      "Ctrl+]",     lambda: self.rotate_selected_obb(1.0)),
+    # ── Shortcuts ─────────────────────────────────────────────────────
+    def _setup_shortcuts(self):
+        pairs=[
+            ("Ctrl+O",self.open_folder),("Ctrl+S",self.save),
+            ("Ctrl+Z",self.undo),       ("N",self.next_img),
+            ("P",self.prev_img),        ("Delete",self.delete_sel),
+            ("Backspace",self.delete_sel),("Escape",self.deselect),
+            ("Z",self.zoom_reset),      ("R",self.reject_img),
+            ("Ctrl+Left",  lambda: self.rotate_image(-15)),
+            ("Ctrl+Right", lambda: self.rotate_image(15)),
+            ("Ctrl+R",     self.rotate_custom),
+            ("M",lambda: self.set_cls(0)), ("W",lambda: self.set_cls(1)),
+            ("0",lambda: self.set_cls(2)), ("1",lambda: self.set_cls(3)),
+            ("2",lambda: self.set_cls(4)), ("3",lambda: self.set_cls(5)),
+            ("4",lambda: self.set_cls(6)), ("5",lambda: self.set_cls(7)),
+            ("6",lambda: self.set_cls(8)), ("7",lambda: self.set_cls(9)),
+            ("8",lambda: self.set_cls(10)),("9",lambda: self.set_cls(11)),
+            ("U",lambda: self.set_cls(12)),
+            ("Ctrl+[",lambda: self.rotate_selected_obb(-1.0)),
+            ("Ctrl+]",lambda: self.rotate_selected_obb(1.0)),
         ]
-        for name, shortcut, slot in shortcuts:
-            action = QAction(name, self)
-            action.setShortcut(QKeySequence(shortcut))
-            action.triggered.connect(slot)
-            self.addAction(action)
+        for key,slot in pairs:
+            a=QAction(key,self); a.setShortcut(QKeySequence(key))
+            a.triggered.connect(slot); self.addAction(a)
 
-    # ------------------------------------------------------------------
-    # Image / folder management
-    # ------------------------------------------------------------------
-    def enable_crop_mode(self):
-        if self.current_image is None:
-            self.update_status(extra="Open an image first.")
-            return
-        self.canvas.crop_mode_enabled = True
-        self.canvas.mode = "idle"
-        self.selected_box_index = None
-        self.canvas.update_scaled_pixmap()
-        self.update_status(
-            extra="Crop mode enabled. Draw a rectangle around the useful area.")
+    # ── Image rotation (same pattern as label_images.py) ──────────────
+    def on_slider_changed(self, angle: float):
+        """Live preview: rotate the displayed image without writing to disk."""
+        self._preview_angle=angle
+        if self.cur_img is None: return
+        preview=(self.cur_img if abs(angle)<0.05
+                 else rotate_image(self.cur_img, angle))
+        rgb=cv2.cvtColor(preview,cv2.COLOR_BGR2RGB)
+        h,w=preview.shape[:2]
+        qi=QImage(rgb.data,w,h,rgb.strides[0],QImage.Format_RGB888)
+        self.canvas.base_pix=QPixmap.fromImage(qi.copy())
+        self.canvas.refresh()
 
-    def open_folder(self):
-        start_folder = self.image_dir if self.image_dir else os.getcwd()
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Image Folder", start_folder,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontUseNativeDialog)
-        if not folder:
-            return
-        image_files = list_image_files(folder)
-        if not image_files:
-            safe_message(self, "No Images",
-                         "This folder has no supported images.")
-            return
-        self.image_dir = folder
-        parent_dir = os.path.dirname(folder)
-        self.label_dir = os.path.join(parent_dir, "labels_obb")
-        os.makedirs(self.label_dir, exist_ok=True)
-        self.image_files = image_files
-        self.current_index = 0
-        self.load_current_image()
-        self.update_status(
-            extra=f"Images: {self.image_dir} | Labels: {self.label_dir}")
+    def apply_slider_rotation(self, angle: float):
+        """Write the slider rotation to disk, same as the button rotation."""
+        if abs(angle)<0.05: self.set_status("No rotation to apply."); return
+        self._preview_angle=0.0
+        self._restore_canvas()        # put real image back first
+        self.rotate_image(angle)      # then do destructive rotate
 
-    def current_label_path(self):
-        if not self.label_dir or not self.image_files:
-            return None
-        stem = os.path.splitext(self.image_files[self.current_index])[0]
-        return os.path.join(self.label_dir, f"{stem}.txt")
+    def _restore_canvas(self):
+        if self.cur_img is None: return
+        rgb=cv2.cvtColor(self.cur_img,cv2.COLOR_BGR2RGB)
+        h,w=self.cur_img.shape[:2]
+        qi=QImage(rgb.data,w,h,rgb.strides[0],QImage.Format_RGB888)
+        self.canvas.base_pix=QPixmap.fromImage(qi.copy())
+        self.canvas.refresh()
 
-    def push_undo_state(self):
-        self.undo_stack.append(
-            ([b.copy() for b in self.boxes],
-             [b.copy() for b in self.obb_boxes]))
-        if len(self.undo_stack) > 200:
-            self.undo_stack.pop(0)
+    def rotate_image(self, angle_deg: float):
+        """Destructively rotate the current image file and clear its labels."""
+        if not self.img_files: return
+        path=os.path.join(self.img_dir,self.img_files[self.idx])
+        if self.boxes or self.obbs:
+            if not safe_confirm(self,"Rotate Image",
+                "This image already has labels.\n\n"
+                "Rotating will clear them because positions no longer match.\n\nContinue?",
+                "Yes, Rotate","Cancel"):
+                self.set_status("Rotation cancelled."); return
+        img=cv2.imread(path)
+        if img is None: self.set_status(f"Cannot read {path}"); return
+        cv2.imwrite(path, rotate_image(img, angle_deg))
+        self._clear_label_file(); self.load()
+        self.set_status(f"Image rotated {angle_deg:+.1f}° and saved. Labels cleared.")
+
+    def rotate_custom(self):
+        angle,ok=QInputDialog.getDouble(
+            self,"Rotate Image","Enter angle in degrees:",0.0,-360.0,360.0,2)
+        if ok: self.rotate_image(angle)
+
+    # ── OBB rotation ──────────────────────────────────────────────────
+    def rotate_selected_obb(self, delta):
+        if self.sel and self.sel[0]=="obb" and self.sel[1]<len(self.obbs):
+            self.obbs[self.sel[1]].angle+=delta; self.canvas.refresh()
+            self.set_status(f"Angle {self.obbs[self.sel[1]].angle:.1f}°")
+
+    # ── Undo ──────────────────────────────────────────────────────────
+    def push_undo(self):
+        self._undo.append(([b.copy() for b in self.boxes],[o.copy() for o in self.obbs]))
+        if len(self._undo)>200: self._undo.pop(0)
 
     def undo(self):
-        if not self.undo_stack:
-            self.update_status(extra="Nothing to undo.")
-            return
-        self.boxes, self.obb_boxes = self.undo_stack.pop()
-        self.selected_box_index = None
-        self.canvas.update_scaled_pixmap()
-        self.update_status(extra="Undid last action.")
+        if not self._undo: self.set_status("Nothing to undo"); return
+        self.boxes,self.obbs=self._undo.pop(); self.sel=None
+        self.canvas.refresh(); self.set_status("Undone")
 
-    def clear_selection(self):
-        self.selected_box_index = None
-        self.canvas.crop_mode_enabled = False
-        self.obb_angle_label.setText("")
-        self.canvas.update_scaled_pixmap()
-        self.update_status(extra="Selection cleared.")
+    # ── Navigation ────────────────────────────────────────────────────
+    def open_folder(self):
+        folder=QFileDialog.getExistingDirectory(
+            self,"Select Image Folder",os.getcwd(),
+            QFileDialog.ShowDirsOnly|QFileDialog.DontUseNativeDialog)
+        if not folder: return
+        files=sorted(f for f in os.listdir(folder)
+                     if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
+        if not files: self.set_status("No images found."); return
+        self.img_dir=folder
+        parent=os.path.dirname(folder)
+        self.lbl_dir=os.path.join(parent,"labels_obb")
+        self.removed_img_dir=os.path.join(parent,"obb_removed_images")
+        self.removed_lbl_dir=os.path.join(parent,"obb_removed_labels")
+        for d in [self.lbl_dir,self.removed_img_dir,self.removed_lbl_dir]:
+            os.makedirs(d,exist_ok=True)
+        self.img_files=files; self.idx=0; self.load()
+        self.set_status(f"Loaded {len(files)} images")
 
-    def load_current_image(self):
-        if not self.image_dir or not self.image_files:
-            return
-        image_path = os.path.join(self.image_dir,
-                                   self.image_files[self.current_index])
-        image = cv2.imread(image_path)
-        if image is None:
-            self.canvas.clear_image()
-            self.current_image = None
-            self.current_image_w = 0
-            self.current_image_h = 0
-            self.boxes = []
-            self.obb_boxes = []
-            self.selected_box_index = None
-            self.update_status(
-                extra=f"Failed to load: {self.image_files[self.current_index]}")
-            return
+    def next_img(self): self.save(); \
+        (self.idx.__setitem__(0,self.idx+1) if False else None); \
+        self._nav(1)
+    def prev_img(self): self._nav(-1)
 
-        self.current_image = image
-        self.current_image_h, self.current_image_w = image.shape[:2]
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        qimage = QImage(rgb.data, self.current_image_w, self.current_image_h,
-                        rgb.strides[0], QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimage.copy())
+    def _nav(self, d):
+        self.save()
+        self.idx=max(0,min(len(self.img_files)-1,self.idx+d)); self.load()
 
-        self.undo_stack = []
-        self.boxes = []
-        self.obb_boxes = []
-        self.selected_box_index = None
-        self.canvas.crop_mode_enabled = False
-        self._preview_angle = 0.0
-        self.rotation_slider.slider.blockSignals(True)
-        self.rotation_slider.slider.setValue(0)
-        self.rotation_slider.slider.blockSignals(False)
-        self.rotation_slider.angle_label.setText("0.0°")
-        self.obb_angle_label.setText("")
+    # ── Load / Save ───────────────────────────────────────────────────
+    def _lbl_path(self):
+        if not self.lbl_dir or not self.img_files: return None
+        stem=os.path.splitext(self.img_files[self.idx])[0]
+        return os.path.join(self.lbl_dir,f"{stem}.txt")
 
-        self.canvas.set_image(pixmap)
-        self.load_labels()
-        self.update_status()
-        self.update_zoom_indicator()
+    def _img_path(self):
+        if not self.img_dir or not self.img_files: return None
+        return os.path.join(self.img_dir,self.img_files[self.idx])
 
-    # ------------------------------------------------------------------
-    # Label I/O
-    # ------------------------------------------------------------------
-    def load_labels(self):
-        self.boxes = []
-        self.obb_boxes = []
-        self.selected_box_index = None
-
-        label_path = self.current_label_path()
-        if not label_path or not os.path.exists(label_path):
-            self.canvas.update_scaled_pixmap()
-            return
-
-        try:
-            with open(label_path, "r", encoding="utf-8") as f:
+    def load(self):
+        path=self._img_path()
+        if not path: return
+        img=cv2.imread(path)
+        if img is None: self.set_status(f"Cannot read {path}"); return
+        self.cur_img=img; self.ih,self.iw=img.shape[:2]
+        rgb=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
+        qi=QImage(rgb.data,self.iw,self.ih,rgb.strides[0],QImage.Format_RGB888)
+        self.canvas.set_image(QPixmap.fromImage(qi.copy()))
+        self.boxes=[]; self.obbs=[]; self.sel=None; self._undo=[]
+        self._preview_angle=0.0
+        self.rot_slider.slider.blockSignals(True)
+        self.rot_slider.slider.setValue(0)
+        self.rot_slider.slider.blockSignals(False)
+        self.rot_slider.angle_lbl.setText("0.0°")
+        lp=self._lbl_path()
+        if lp and os.path.exists(lp):
+            with open(lp) as f:
                 for line in f:
-                    parts = line.strip().split()
-                    if not parts:
-                        continue
+                    parts=line.strip().split()
+                    if not parts: continue
+                    cid=int(parts[0])
+                    if cid==WINDOW_CLS and len(parts)==9:
+                        self.obbs.append(OBB.from_yolo(parts,self.iw,self.ih))
+                    elif len(parts)==5:
+                        xc,yc,w,h=map(float,parts[1:])
+                        bw,bh=w*self.iw,h*self.ih; cx,cy=xc*self.iw,yc*self.ih
+                        self.boxes.append(Box(cid,cx-bw/2,cy-bh/2,cx+bw/2,cy+bh/2))
+        self.canvas.refresh()
+        self.set_status(f"{self.idx+1}/{len(self.img_files)}  {self.img_files[self.idx]}")
 
-                    class_id = int(parts[0])
+    def save(self):
+        lp=self._lbl_path()
+        if not lp: return
+        with open(lp,"w") as f:
+            for b in self.boxes:
+                xc,yc,w,h=b.normalized(self.iw,self.ih)
+                f.write(f"{b.cls} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+            for o in self.obbs:
+                f.write(o.to_yolo(self.iw,self.ih)+"\n")
+        self.set_status("Saved ✓")
 
-                    if class_id == WINDOW_CLASS_ID and len(parts) == 9:
-                        # OBB format: class x1 y1 x2 y2 x3 y3 x4 y4
-                        obb = OBBBox.from_yolo_line(
-                            parts, self.current_image_w, self.current_image_h)
-                        self.obb_boxes.append(obb)
+    def _clear_label_file(self):
+        lp=self._lbl_path()
+        if lp and os.path.exists(lp):
+            open(lp,"w").close()
 
-                    elif len(parts) == 5:
-                        # Normal YOLO
-                        x_center, y_center, width, height = map(float, parts[1:])
-                        if class_id < 0 or class_id >= len(CLASS_NAMES):
-                            continue
-                        box = Box.from_normalized(
-                            class_id, x_center, y_center, width, height,
-                            self.current_image_w, self.current_image_h)
-                        self.boxes.append(box)
-
-        except Exception as e:
-            self.update_status(extra=f"Label load error: {e}")
-
-        self.canvas.update_scaled_pixmap()
-
-    def save_labels(self):
-        label_path = self.current_label_path()
-        if not label_path:
-            return
+    def reject_img(self):
+        if not self.img_files: return
+        ip=self._img_path(); lp=self._lbl_path()
         try:
-            with open(label_path, "w", encoding="utf-8") as f:
-                # Regular boxes
-                for box in self.boxes:
-                    xc, yc, w, h = box.normalized(
-                        self.current_image_w, self.current_image_h)
-                    f.write(f"{box.class_id} "
-                            f"{xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
-                # OBB boxes
-                for obb in self.obb_boxes:
-                    f.write(obb.to_yolo_line(
-                        self.current_image_w, self.current_image_h) + "\n")
-            self.update_status(extra="Saved.")
-        except Exception as e:
-            self.update_status(extra=f"Save error: {e}")
+            if ip and os.path.exists(ip):
+                shutil.move(ip,os.path.join(self.removed_img_dir,self.img_files[self.idx]))
+            if lp and os.path.exists(lp):
+                shutil.move(lp,os.path.join(self.removed_lbl_dir,os.path.basename(lp)))
+            removed=self.img_files.pop(self.idx)
+            if not self.img_files: self.set_status("All images done!"); return
+            if self.idx>=len(self.img_files): self.idx=len(self.img_files)-1
+            self.load(); self.set_status(f"Rejected '{removed}'")
+        except Exception as ex: self.set_status(f"Reject error: {ex}")
 
-    def clear_label_file(self):
-        label_path = self.current_label_path()
-        if label_path and os.path.exists(label_path):
-            with open(label_path, "w", encoding="utf-8") as f:
-                f.write("")
-
-    # ------------------------------------------------------------------
-    # Image operations
-    # ------------------------------------------------------------------
-    def crop_current_image(self, start_img, end_img):
-        if not self.image_dir or not self.image_files:
-            return
-        image_path = os.path.join(self.image_dir,
-                                   self.image_files[self.current_index])
-        if self.boxes or self.obb_boxes:
-            confirmed = safe_confirm(
-                self, "Crop Image",
-                "This image already has labels.\n\n"
-                "Cropping will clear them. Continue?",
-                yes_text="Yes, Crop", no_text="Cancel")
-            if not confirmed:
-                self.update_status(extra="Cropping cancelled.")
-                return
-        image = cv2.imread(image_path)
-        if image is None:
-            return
-        x1, y1 = start_img
-        x2, y2 = end_img
-        cropped = crop_image(image, x1, y1, x2, y2)
-        if cropped is None:
-            self.update_status(extra="Invalid crop area.")
-            return
-        cv2.imwrite(image_path, cropped)
-        self.clear_label_file()
-        self.load_current_image()
-        self.update_status(extra="Image cropped and saved. Labels cleared.")
-
-    def remove_current_image(self):
-        if not self.image_dir or not self.image_files:
-            return
-        image_name = self.image_files[self.current_index]
-        image_path = os.path.join(self.image_dir, image_name)
-        label_path = self.current_label_path()
-
-        confirmed = safe_confirm(
-            self, "Remove Image",
-            f"Remove {image_name} from the dataset?\n\n"
-            "Image and label will be moved to removed_images/ and removed_labels/.",
-            yes_text="Yes, Remove", no_text="Cancel")
-        if not confirmed:
-            return
-
-        dataset_root = os.path.dirname(self.image_dir)
-        removed_images_dir = os.path.join(dataset_root, "obb_removed_images")
-        removed_labels_dir = os.path.join(dataset_root, "obb_removed_labels")
-        os.makedirs(removed_images_dir, exist_ok=True)
-        os.makedirs(removed_labels_dir, exist_ok=True)
-
-        try:
-            self.canvas.clear_image()
-            self.current_image = None
-            self.current_image_w = 0
-            self.current_image_h = 0
-            self.boxes = []
-            self.obb_boxes = []
-            self.selected_box_index = None
-            self.undo_stack = []
-
-            if os.path.exists(image_path):
-                dst = unique_destination_path(
-                    os.path.join(removed_images_dir, image_name))
-                shutil.move(image_path, dst)
-            if label_path and os.path.exists(label_path):
-                dst = unique_destination_path(
-                    os.path.join(removed_labels_dir,
-                                 os.path.basename(label_path)))
-                shutil.move(label_path, dst)
-
-            del self.image_files[self.current_index]
-            if not self.image_files:
-                self.current_index = 0
-                self.update_status(extra="Removed image. No images left.")
-                return
-            if self.current_index >= len(self.image_files):
-                self.current_index = len(self.image_files) - 1
-            self.load_current_image()
-            self.update_status(extra=f"Removed image: {image_name}")
-
-        except Exception as e:
-            self.update_status(extra=f"Remove error: {e}")
-
-    def rotate_current_image(self, angle_degrees: float):
-        if not self.image_dir or not self.image_files:
-            return
-        image_path = os.path.join(self.image_dir,
-                                   self.image_files[self.current_index])
-        if self.boxes or self.obb_boxes:
-            confirmed = safe_confirm(
-                self, "Rotate Image",
-                "This image already has labels.\n\n"
-                "Rotating will clear them. Continue?",
-                yes_text="Yes, Rotate", no_text="Cancel")
-            if not confirmed:
-                self.update_status(extra="Rotation cancelled.")
-                return
-        image = cv2.imread(image_path)
-        if image is None:
-            return
-        rotated = rotate_image_keep_size_crop_edges(image, angle_degrees)
-        cv2.imwrite(image_path, rotated)
-        self.clear_label_file()
-        self.load_current_image()
-        self.update_status(
-            extra=f"Image rotated by {angle_degrees}° and saved. Labels cleared.")
-
-    def rotate_custom_angle(self):
-        angle, ok = QInputDialog.getDouble(
-            self, "Rotate Image", "Enter rotation angle in degrees:",
-            0.0, -360.0, 360.0, 2)
-        if ok:
-            self.rotate_current_image(angle)
-
-    def next_image(self):
-        if not self.image_files:
-            return
-        self.save_labels()
-        if self.current_index < len(self.image_files) - 1:
-            self.current_index += 1
-            self.load_current_image()
-
-    def prev_image(self):
-        if not self.image_files:
-            return
-        self.save_labels()
-        if self.current_index > 0:
-            self.current_index -= 1
-            self.load_current_image()
-
-    def set_class(self, class_id: int):
-        self.current_class_id = class_id
-        self.canvas.crop_mode_enabled = False
-        if self.selected_box_index is not None and \
-                0 <= self.selected_box_index < len(self.boxes):
-            if self.boxes[self.selected_box_index].class_id != class_id and \
-                    class_id != WINDOW_CLASS_ID:
-                self.push_undo_state()
-                self.boxes[self.selected_box_index].class_id = class_id
-                self.canvas.update_scaled_pixmap()
-                self.update_status(
-                    extra=f"Selected box → {CLASS_NAMES[class_id]}")
-                return
-        self.update_status(extra=f"Current class: {CLASS_NAMES[class_id]}")
-
-    def delete_selected_box(self):
-        if self.selected_box_index is None:
-            self.update_status(extra="No box selected.")
-            return
-        # Try OBB first when window class active
-        if self.current_class_id == WINDOW_CLASS_ID and \
-                0 <= self.selected_box_index < len(self.obb_boxes):
-            self.push_undo_state()
-            del self.obb_boxes[self.selected_box_index]
-            self.selected_box_index = None
-            self.obb_angle_label.setText("")
-            self.canvas.update_scaled_pixmap()
-            self.update_status(extra="Window OBB box deleted.")
-            return
-        if 0 <= self.selected_box_index < len(self.boxes):
-            self.push_undo_state()
-            del self.boxes[self.selected_box_index]
-            self.selected_box_index = None
-            self.canvas.update_scaled_pixmap()
-            self.update_status(extra="Box deleted.")
-
-    def find_box_at(self, x, y):
-        for i in range(len(self.boxes) - 1, -1, -1):
-            if self.boxes[i].contains(x, y):
-                return i
+    # ── Hit-test helpers ──────────────────────────────────────────────
+    def box_handle_at(self,x,y):
+        tol=max(6,9/max(self.canvas.scale,1e-6))
+        for i in range(len(self.boxes)-1,-1,-1):
+            b=self.boxes[i]; a,c2,d,e=b.rect()
+            for name,(hx,hy) in [("tl",(a,c2)),("tr",(d,c2)),("bl",(a,e)),("br",(d,e))]:
+                if abs(x-hx)<=tol and abs(y-hy)<=tol: return i,name
         return None
 
-    def get_handle_at(self, x, y):
-        tolerance = max(6, HANDLE_SIZE / max(self.canvas.scale, 1e-6))
-        for i in range(len(self.boxes) - 1, -1, -1):
-            box = self.boxes[i]
-            x_min, y_min, x_max, y_max = box.rect()
-            handles = {
-                "tl": (x_min, y_min), "tr": (x_max, y_min),
-                "bl": (x_min, y_max), "br": (x_max, y_max),
-            }
-            for name, (hx, hy) in handles.items():
-                if abs(x - hx) <= tolerance and abs(y - hy) <= tolerance:
-                    return i, name
-        return None
+    # ── Drawing ───────────────────────────────────────────────────────
+    def draw_all(self,p:QPainter,sc,ox,oy):
+        for i,b in enumerate(self.boxes):
+            a,top,c2,bot=b.rect(); color=CLASS_COLORS.get(b.cls,QColor(255,255,255))
+            p.setPen(QPen(color,3 if self.sel==("box",i) else 2)); p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(a*sc+ox,top*sc+oy,(c2-a)*sc,(bot-top)*sc))
+            tx,ty=int(a*sc+ox),int(top*sc+oy); tag=CLASS_NAMES[b.cls]
+            p.fillRect(tx,max(0,ty-18),len(tag)*8+8,18,color)
+            p.setPen(Qt.black); p.drawText(tx+4,max(13,ty-4),tag)
+            if self.sel==("box",i):
+                p.setBrush(QBrush(Qt.white)); p.setPen(QPen(Qt.black,1))
+                for hx,hy in [(a,top),(c2,top),(a,bot),(c2,bot)]:
+                    p.drawRect(QRectF(hx*sc+ox-5,hy*sc+oy-5,10,10))
 
-    def get_border_at(self, x, y):
-        tolerance = max(6, HANDLE_SIZE / max(self.canvas.scale, 1e-6))
-        for i in range(len(self.boxes) - 1, -1, -1):
-            box = self.boxes[i]
-            x_min, y_min, x_max, y_max = box.rect()
-            near_left = abs(x - x_min) <= tolerance and y_min <= y <= y_max
-            near_right = abs(x - x_max) <= tolerance and y_min <= y <= y_max
-            near_top = abs(y - y_min) <= tolerance and x_min <= x <= x_max
-            near_bottom = abs(y - y_max) <= tolerance and x_min <= x <= x_max
-            if near_left or near_right or near_top or near_bottom:
-                return i
-        return None
+        for i,obb in enumerate(self.obbs):
+            color=CLASS_COLORS.get(obb.cls,QColor(255,60,60))
+            is_sel=(self.sel and self.sel[0]=="obb" and self.sel[1]==i)
+            p.setPen(QPen(color,3 if is_sel else 2)); p.setBrush(Qt.NoBrush)
+            cw=obb.corners_w(sc,ox,oy)
+            p.drawPolygon(QPolygonF([QPointF(x,y) for x,y in cw]))
+            tx,ty=int(cw[0][0]),int(cw[0][1]); tag=f"window {obb.angle:.1f}°"
+            p.fillRect(tx,max(0,ty-18),len(tag)*7+8,18,color)
+            p.setPen(Qt.black); p.drawText(tx+4,max(13,ty-4),tag)
+            p.setBrush(QBrush(Qt.white if is_sel else color)); p.setPen(QPen(Qt.black,1))
+            for hxi,hyi in obb.handle_points():
+                p.drawEllipse(QPointF(hxi*sc+ox,hyi*sc+oy),5,5)
+            hx_w,hy_w=obb.rot_handle(sc,ox,oy)
+            top_cx=(cw[0][0]+cw[1][0])/2; top_cy=(cw[0][1]+cw[1][1])/2
+            p.setPen(QPen(color,1,Qt.DashLine)); p.setBrush(Qt.NoBrush)
+            p.drawLine(QPointF(top_cx,top_cy),QPointF(hx_w,hy_w))
+            p.setBrush(QBrush(Qt.white if is_sel else color))
+            p.setPen(QPen(color,2)); p.drawEllipse(QPointF(hx_w,hy_w),9,9)
+            p.setPen(QPen(Qt.black,1)); p.setBrush(Qt.NoBrush)
+            p.drawText(int(hx_w)-3,int(hy_w)+5,"◉")
+            if is_sel:
+                lc=((cw[0][0]+cw[3][0])/2,(cw[0][1]+cw[3][1])/2)
+                rc=((cw[1][0]+cw[2][0])/2,(cw[1][1]+cw[2][1])/2)
+                p.setPen(QPen(QColor(255,255,100),2)); p.setBrush(Qt.NoBrush)
+                p.drawLine(QPointF(*lc),QPointF(*rc))
 
-    # ------------------------------------------------------------------
-    # Drawing
-    # ------------------------------------------------------------------
-    def draw_boxes(self, painter: QPainter, scale: float,
-                   offset_x: int, offset_y: int):
-        # Regular boxes
-        for i, box in enumerate(self.boxes):
-            x_min, y_min, x_max, y_max = box.rect()
-            x1 = x_min * scale + offset_x
-            y1 = y_min * scale + offset_y
-            x2 = x_max * scale + offset_x
-            y2 = y_max * scale + offset_y
+    # ── Misc ──────────────────────────────────────────────────────────
+    def delete_sel(self):
+        if not self.sel: return
+        self.push_undo(); kind,idx=self.sel
+        if kind=="obb" and idx<len(self.obbs): del self.obbs[idx]
+        elif kind=="box" and idx<len(self.boxes): del self.boxes[idx]
+        self.sel=None; self.canvas.refresh(); self.set_status("Deleted")
 
-            color = CLASS_COLORS.get(box.class_id, QColor(255, 255, 255))
-            pen_width = 3 if i == self.selected_box_index else 2
-            painter.setPen(QPen(color, pen_width))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(QRectF(QPointF(x1, y1), QPointF(x2, y2)))
+    def deselect(self):
+        self.sel=None; self.canvas.refresh()
 
-            label_text = CLASS_NAMES[box.class_id]
-            text_width = 22 if label_text in list("0123456789") \
-                else len(label_text) * 8 + 12
-            text_height = 20
-            label_top = max(0, int(y1) - text_height)
-            painter.fillRect(int(x1), label_top, text_width, text_height, color)
-            painter.setPen(Qt.black)
-            painter.drawText(int(x1) + 5, label_top + 15, label_text)
+    def set_cls(self,cid):
+        self.cur_cls=cid
+        for i,b in enumerate(self._cls_btns): b.setChecked(i==cid)
+        self.set_status(f"Class → {CLASS_NAMES[cid]}")
 
-            if i == self.selected_box_index:
-                painter.setBrush(QBrush(QColor(255, 255, 255)))
-                painter.setPen(QPen(Qt.black, 1))
-                for hx, hy in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
-                    painter.drawRect(QRectF(
-                        hx - HANDLE_SIZE / 2, hy - HANDLE_SIZE / 2,
-                        HANDLE_SIZE, HANDLE_SIZE))
+    def zoom_reset(self):
+        self.canvas.zoom=1.0; self.canvas.pan_x=self.canvas.pan_y=0.0
+        self.canvas.refresh(); self.update_zoom_label()
 
-        # OBB boxes
-        for i, obb in enumerate(self.obb_boxes):
-            color = CLASS_COLORS.get(obb.class_id, QColor(255, 0, 0))
-            is_selected = (i == self.selected_box_index and
-                           self.current_class_id == WINDOW_CLASS_ID)
-            # also treat as selected if canvas mode is obb_rotating/obb_moving
-            if self.canvas.mode in ("obb_rotating", "obb_moving") and \
-                    i == self.selected_box_index:
-                is_selected = True
+    def update_zoom_label(self):
+        self.zoom_lbl.setText(f"{int(self.canvas.zoom*100)}%")
 
-            pen_width = 3 if is_selected else 2
-            painter.setPen(QPen(color, pen_width))
-            painter.setBrush(Qt.NoBrush)
+    def set_status(self,msg):
+        n=len(self.img_files)
+        base=f"[{self.idx+1}/{n}] {self.img_files[self.idx]}  " if n else ""
+        self.status_lbl.setText(
+            base+msg+"  |  "
+            "W=window M=meter 0-9=digit U=unknown  N/P=next/prev  "
+            "S=save  R=reject  Del=delete  Ctrl+Z=undo  "
+            "Scroll=zoom  Mid=pan  Z=reset  "
+            "Drag◉/Shift+Scroll/Ctrl+[]=rotate OBB  "
+            "↶↷=rotate image  Ctrl+R=custom  Slider=live preview")
+        self.update_zoom_label()
 
-            corners_w = obb.corners_widget(scale, offset_x, offset_y)
-            poly = QPolygonF([QPointF(x, y) for x, y in corners_w])
-            painter.drawPolygon(poly)
+    def next_img(self):
+        self.save()
+        if self.idx<len(self.img_files)-1: self.idx+=1; self.load()
 
-            # Label tag
-            tx, ty = corners_w[0]
-            tag_text = f"window {obb.angle:.1f}°"
-            tag_w = len(tag_text) * 7 + 10
-            tag_h = 18
-            tag_top = max(0, int(ty) - tag_h)
-            painter.fillRect(int(tx), tag_top, tag_w, tag_h, color)
-            painter.setPen(Qt.black)
-            painter.drawText(int(tx) + 4, tag_top + 13, tag_text)
+    def prev_img(self):
+        self.save()
+        if self.idx>0: self.idx-=1; self.load()
 
-            # Rotation handle (circle above top-centre)
-            hx, hy = obb.rotate_handle_widget(scale, offset_x, offset_y)
-            # Line from top-centre to handle
-            top_cx = (corners_w[0][0] + corners_w[1][0]) / 2.0
-            top_cy = (corners_w[0][1] + corners_w[1][1]) / 2.0
-            painter.setPen(QPen(color, 1, Qt.DashLine))
-            painter.drawLine(QPointF(top_cx, top_cy), QPointF(hx, hy))
-
-            # Handle circle
-            hr = 8
-            if is_selected:
-                painter.setBrush(QBrush(QColor(255, 255, 255)))
-                painter.setPen(QPen(color, 2))
-            else:
-                painter.setBrush(QBrush(color))
-                painter.setPen(QPen(Qt.black, 1))
-            painter.drawEllipse(QPointF(hx, hy), hr, hr)
-
-            # Draw direction arrow on the box to show "long side"
-            # Arrow along the long axis from left-centre to right-centre
-            if is_selected:
-                lc_x = (corners_w[0][0] + corners_w[3][0]) / 2.0
-                lc_y = (corners_w[0][1] + corners_w[3][1]) / 2.0
-                rc_x = (corners_w[1][0] + corners_w[2][0]) / 2.0
-                rc_y = (corners_w[1][1] + corners_w[2][1]) / 2.0
-                painter.setPen(QPen(QColor(255, 255, 100), 2))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawLine(QPointF(lc_x, lc_y), QPointF(rc_x, rc_y))
-                # Arrowhead at right end
-                dx = rc_x - lc_x
-                dy = rc_y - lc_y
-                length = math.hypot(dx, dy)
-                if length > 1:
-                    ux = dx / length
-                    uy = dy / length
-                    arr_len = 10
-                    arr_w = 5
-                    p1 = QPointF(rc_x - ux * arr_len - uy * arr_w,
-                                 rc_y - uy * arr_len + ux * arr_w)
-                    p2 = QPointF(rc_x - ux * arr_len + uy * arr_w,
-                                 rc_y - uy * arr_len - ux * arr_w)
-                    painter.drawLine(QPointF(rc_x, rc_y), p1)
-                    painter.drawLine(QPointF(rc_x, rc_y), p2)
-
-    # ------------------------------------------------------------------
-    def update_status(self, extra: str = ""):
-        shortcuts_text = (
-            "M=meter | W=window(OBB) | 0..9=digit | U=unknown | "
-            "C=crop | N=next | P=prev | R=rotate90° | "
-            "Ctrl←=-15° | Ctrl→=+15° | Ctrl+R=custom | "
-            "Scroll=zoom | =/- =zoom | Z=reset | Mid-drag=pan | "
-            "OBB: drag◉=rotate | Shift+Scroll=fine rotate | Ctrl+[/]=±1° | "
-            "Delete=del box | Ctrl+D=remove img | Ctrl+Z=undo | Esc=clear"
-        )
-        if not self.image_files:
-            self.info_label.setText(
-                f"Open an image folder to begin.\n{shortcuts_text}")
-            return
-
-        image_name = self.image_files[self.current_index]
-        class_name = CLASS_NAMES[self.current_class_id]
-        status = (
-            f"Image {self.current_index + 1}/{len(self.image_files)}: "
-            f"{image_name} | "
-            f"Class: {self.current_class_id} ({class_name}) | "
-            f"Boxes: {len(self.boxes)} regular + {len(self.obb_boxes)} OBB"
-        )
-        if extra:
-            status += f" | {extra}"
-        status += "\n" + shortcuts_text
-        self.info_label.setText(status)
-
-    def closeEvent(self, event):
-        try:
-            self.save_labels()
-        except Exception:
-            pass
-        event.accept()
+    def closeEvent(self,e):
+        try: self.save()
+        except: pass
+        e.accept()
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+    app=QApplication(sys.argv); app.setStyle("Fusion")
+    win=App(); win.show(); sys.exit(app.exec())
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
