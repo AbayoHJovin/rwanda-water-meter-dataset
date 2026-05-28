@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-01_label_meter.py  —  Water Meter Window Labeler with Image Rotation
+01_label_window.py  —  Water Meter Window Labeler with Image Rotation
 
 Draw the digit-window OBB (Oriented Bounding Box):
   1. Press W, draw a rectangle over the digit window
